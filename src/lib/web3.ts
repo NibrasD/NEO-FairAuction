@@ -8,7 +8,7 @@ export const NEO_X_MAINNET = {
     symbol: 'GAS',
     decimals: 18,
   },
-  rpcUrls: ['https://mainnet.neoxscan.io'],
+  rpcUrls: ['https://mainnet-1.rpc.banelabs.org'],
   blockExplorerUrls: ['https://xexplorer.neo.org'],
 };
 
@@ -37,27 +37,47 @@ export async function connectWallet(): Promise<ethers.BrowserProvider | null> {
     const provider = new ethers.BrowserProvider(window.ethereum);
 
     const network = await provider.getNetwork();
-    if (network.chainId !== BigInt(NEO_X_MAINNET.chainId)) {
+    console.log('Connected to network:', network.chainId.toString(), '(0x' + network.chainId.toString(16) + ')');
+
+    // Accept Neo X Mainnet (47763) and Neo X TestNet (12227332)
+    const validChainIds = [BigInt(47763), BigInt(12227332)];
+
+    if (!validChainIds.includes(network.chainId)) {
       try {
+        // Try to switch to Neo X Mainnet automatically
         await window.ethereum.request({
           method: 'wallet_switchEthereumChain',
           params: [{ chainId: NEO_X_MAINNET.chainId }],
         });
+        // Reload provider after switch
+        const newProvider = new ethers.BrowserProvider(window.ethereum);
+        return newProvider;
       } catch (switchError: any) {
+        // If the chain hasn't been added to MetaMask, add it
         if (switchError.code === 4902) {
-          await window.ethereum.request({
-            method: 'wallet_addEthereumChain',
-            params: [NEO_X_MAINNET],
-          });
-        } else {
-          throw switchError;
+          try {
+            await window.ethereum.request({
+              method: 'wallet_addEthereumChain',
+              params: [NEO_X_MAINNET],
+            });
+            const newProvider = new ethers.BrowserProvider(window.ethereum);
+            return newProvider;
+          } catch (addError) {
+            console.error('Error adding network:', addError);
+            alert('Failed to add Neo X network. Please add it manually in MetaMask.');
+            return null;
+          }
         }
+        console.error('Error switching network:', switchError);
+        alert(`Wrong network! Current Chain ID: ${network.chainId}. Please switch to Neo X Mainnet (47763) in MetaMask.`);
+        return null;
       }
     }
 
     return provider;
   } catch (error) {
     console.error('Error connecting wallet:', error);
+    alert('Error connecting wallet. Please try again.');
     return null;
   }
 }
@@ -76,12 +96,18 @@ export async function sendMEVProtectedTransaction(
   if (!signer) throw new Error('No signer available');
 
   const contractWithSigner = contract.connect(signer);
-  const tx = await contractWithSigner[method](...params, {
-    value: value || 0,
+
+  const txOptions: any = {
     type: 2,
     maxPriorityFeePerGas: ethers.parseUnits('1', 'gwei'),
     maxFeePerGas: ethers.parseUnits('50', 'gwei'),
-  });
+  };
+
+  if (value) {
+    txOptions.value = value;
+  }
+
+  const tx = await contractWithSigner[method](...params, txOptions);
 
   return tx.wait();
 }
