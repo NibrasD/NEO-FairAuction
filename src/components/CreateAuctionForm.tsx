@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { Plus, Shield, ShieldOff } from 'lucide-react';
 import { ethers } from 'ethers';
+import { getContract, sendMEVProtectedTransaction } from '../lib/web3';
+import { supabase } from '../lib/supabase';
 
 interface CreateAuctionFormProps {
   provider: ethers.BrowserProvider | null;
@@ -27,18 +29,86 @@ export function CreateAuctionForm({ provider, onAuctionCreated }: CreateAuctionF
 
     setIsCreating(true);
     try {
-      alert('Note: Replace CONTRACT_ADDRESS in src/lib/web3.ts with your deployed contract address');
-      setIsOpen(false);
-      setFormData({
-        itemName: '',
-        description: '',
-        startingBid: '',
-        duration: '3600',
-        mevProtected: true,
+      const contract = getContract(provider);
+      const signer = await provider.getSigner();
+      const signerAddress = await signer.getAddress();
+      const contractWithSigner = contract.connect(signer);
+
+      const startingBidWei = ethers.parseEther(formData.startingBid);
+      const durationSeconds = parseInt(formData.duration);
+
+      console.log('Creating auction with params:', {
+        itemName: formData.itemName,
+        description: formData.description,
+        startingBid: startingBidWei.toString(),
+        duration: durationSeconds,
+        mevProtected: formData.mevProtected,
       });
-    } catch (error) {
+
+      const tx = await contractWithSigner.createAuction(
+        formData.itemName,
+        formData.description,
+        startingBidWei,
+        durationSeconds,
+        formData.mevProtected
+      );
+
+      console.log('Transaction sent:', tx.hash);
+      const receipt = await tx.wait();
+      console.log('Transaction confirmed:', receipt);
+
+      const auctionCreatedEvent = receipt.logs.find((log: any) => {
+        try {
+          const parsed = contract.interface.parseLog(log);
+          return parsed?.name === 'AuctionCreated';
+        } catch {
+          return false;
+        }
+      });
+
+      if (auctionCreatedEvent) {
+        const parsed = contract.interface.parseLog(auctionCreatedEvent);
+        const auctionId = parsed?.args[0].toString();
+        const endTime = Math.floor(Date.now() / 1000) + durationSeconds;
+
+        await supabase.from('auctions').insert({
+          auction_id: parseInt(auctionId),
+          seller_address: signerAddress,
+          item_name: formData.itemName,
+          description: formData.description,
+          starting_bid: formData.startingBid,
+          current_bid: formData.startingBid,
+          end_time: new Date(endTime * 1000).toISOString(),
+          mev_protected: formData.mevProtected,
+          status: 'active',
+        });
+
+        onAuctionCreated();
+        setIsOpen(false);
+        setFormData({
+          itemName: '',
+          description: '',
+          startingBid: '',
+          duration: '3600',
+          mevProtected: true,
+        });
+        alert('Auction created successfully!');
+      }
+    } catch (error: any) {
       console.error('Error creating auction:', error);
-      alert('Failed to create auction. See console for details.');
+
+      let errorMessage = 'Unknown error';
+      if (error.code === 'ACTION_REJECTED' || error.code === 4001) {
+        errorMessage = 'Transaction rejected by user';
+      } else if (error.reason) {
+        errorMessage = error.reason;
+      } else if (error.message) {
+        errorMessage = error.message;
+      } else if (error.data?.message) {
+        errorMessage = error.data.message;
+      }
+
+      alert(`Failed to create auction: ${errorMessage}`);
     } finally {
       setIsCreating(false);
     }
