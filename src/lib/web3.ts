@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 
 export const NEO_X_MAINNET = {
-  chainId: '0x2f32',
+  chainId: '0xba93',
   chainName: 'Neo X Mainnet',
   nativeCurrency: {
     name: 'GAS',
