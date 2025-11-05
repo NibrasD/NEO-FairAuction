@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { Clock, Shield, ShieldOff, User, TrendingUp } from 'lucide-react';
 import { ethers } from 'ethers';
-import { Auction } from '../lib/supabase';
+import { Auction, supabase } from '../lib/supabase';
+import { getContract, sendMEVProtectedTransaction } from '../lib/web3';
 
 interface AuctionCardProps {
   auction: Auction;
@@ -47,14 +48,55 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
       return;
     }
 
+    const bidAmountFloat = parseFloat(bidAmount);
+    const currentBidFloat = parseFloat(formatGAS(auction.highest_bid !== '0' ? auction.highest_bid : auction.starting_bid));
+
+    if (bidAmountFloat <= currentBidFloat) {
+      alert(`Bid must be higher than current bid of ${currentBidFloat} GAS`);
+      return;
+    }
+
     setIsBidding(true);
     try {
-      alert('Note: Replace CONTRACT_ADDRESS in src/lib/web3.ts with your deployed contract address');
-      setBidAmount('');
-      onBidPlaced();
-    } catch (error) {
+      const contract = getContract(provider);
+      const bidAmountWei = ethers.parseEther(bidAmount);
+
+      const receipt = await sendMEVProtectedTransaction(
+        contract,
+        'placeBid',
+        [auction.auction_id],
+        bidAmountWei.toString()
+      );
+
+      const bidPlacedEvent = receipt.logs.find((log: any) => {
+        try {
+          const parsed = contract.interface.parseLog(log);
+          return parsed?.name === 'BidPlaced';
+        } catch {
+          return false;
+        }
+      });
+
+      if (bidPlacedEvent) {
+        await supabase.from('auctions').update({
+          highest_bid: bidAmountWei.toString(),
+          highest_bidder: userAddress,
+        }).eq('auction_id', auction.auction_id);
+
+        await supabase.from('bids').insert({
+          auction_id: auction.auction_id,
+          bidder_address: userAddress,
+          bid_amount: bidAmount,
+          mev_protected: auction.mev_protected,
+        });
+
+        setBidAmount('');
+        onBidPlaced();
+        alert('Bid placed successfully!');
+      }
+    } catch (error: any) {
       console.error('Error placing bid:', error);
-      alert('Failed to place bid. See console for details.');
+      alert(`Failed to place bid: ${error.message || 'Unknown error'}`);
     } finally {
       setIsBidding(false);
     }
