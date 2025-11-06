@@ -4,6 +4,9 @@
 
 An educational dApp demonstrating MEV (Maximum Extractable Value) protection through commit-reveal patterns on Neo X blockchain. This auction platform provides a side-by-side comparison between vulnerable standard auctions and MEV-protected auctions.
 
+
+Video walkthrough: https://drive.google.com/file/d/1ktduAzAz-jJHCm3Wav7S-FrxjuUQ7Bax/view?usp=sharing
+
 ---
 
 ## Project Overview
