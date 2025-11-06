@@ -71,18 +71,34 @@ export function CreateAuctionForm({ provider, onAuctionCreated }: CreateAuctionF
         const auctionId = parsed?.args[0].toString();
         const endTime = Math.floor(Date.now() / 1000) + durationSeconds;
 
-        await supabase.from('auctions').insert({
-          auction_id: parseInt(auctionId),
+        console.log('Inserting auction into database:', {
+          blockchain_auction_id: parseInt(auctionId),
           seller_address: signerAddress,
           item_name: formData.itemName,
           description: formData.description,
-          starting_bid: formData.startingBid,
-          current_bid: formData.startingBid,
+          starting_bid: startingBidWei.toString(),
+          highest_bid: '0',
           end_time: new Date(endTime * 1000).toISOString(),
           mev_protected: formData.mevProtected,
-          status: 'active',
         });
 
+        const { data, error } = await supabase.from('auctions').insert({
+          blockchain_auction_id: parseInt(auctionId),
+          seller_address: signerAddress,
+          item_name: formData.itemName,
+          description: formData.description,
+          starting_bid: startingBidWei.toString(),
+          highest_bid: '0',
+          end_time: new Date(endTime * 1000).toISOString(),
+          mev_protected: formData.mevProtected,
+        });
+
+        if (error) {
+          console.error('Database insert error:', error);
+          throw new Error(`Failed to save auction to database: ${error.message}`);
+        }
+
+        console.log('Auction saved to database:', data);
         onAuctionCreated();
         setIsOpen(false);
         setFormData({
@@ -93,6 +109,8 @@ export function CreateAuctionForm({ provider, onAuctionCreated }: CreateAuctionF
           mevProtected: true,
         });
         alert('Auction created successfully!');
+      } else {
+        throw new Error('AuctionCreated event not found in transaction receipt');
       }
     } catch (error: any) {
       console.error('Error creating auction:', error);

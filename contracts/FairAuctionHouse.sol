@@ -10,12 +10,20 @@ contract FairAuctionHouse {
         uint256 highestBid;
         address highestBidder;
         uint256 endTime;
+        uint256 revealTime;
         bool ended;
         bool mevProtected;
     }
 
+    struct CommittedBid {
+        bytes32 commitment;
+        uint256 deposit;
+        bool revealed;
+    }
+
     mapping(uint256 => Auction) public auctions;
     mapping(uint256 => mapping(address => uint256)) public pendingReturns;
+    mapping(uint256 => mapping(address => CommittedBid)) public commitments;
 
     uint256 public auctionCount;
 
@@ -25,6 +33,7 @@ contract FairAuctionHouse {
         string itemName,
         uint256 startingBid,
         uint256 endTime,
+        uint256 revealTime,
         bool mevProtected
     );
 
@@ -33,6 +42,18 @@ contract FairAuctionHouse {
         address indexed bidder,
         uint256 amount,
         bool mevProtected
+    );
+
+    event BidCommitted(
+        uint256 indexed auctionId,
+        address indexed bidder,
+        bytes32 commitment
+    );
+
+    event BidRevealed(
+        uint256 indexed auctionId,
+        address indexed bidder,
+        uint256 amount
     );
 
     event AuctionEnded(
@@ -52,6 +73,8 @@ contract FairAuctionHouse {
         require(_duration >= 60, "Duration must be at least 60 seconds");
 
         uint256 auctionId = auctionCount++;
+        uint256 endTime = block.timestamp + _duration;
+        uint256 revealTime = _mevProtected ? endTime + 300 : endTime;
 
         auctions[auctionId] = Auction({
             seller: msg.sender,
@@ -60,7 +83,8 @@ contract FairAuctionHouse {
             startingBid: _startingBid,
             highestBid: 0,
             highestBidder: address(0),
-            endTime: block.timestamp + _duration,
+            endTime: endTime,
+            revealTime: revealTime,
             ended: false,
             mevProtected: _mevProtected
         });
@@ -70,7 +94,8 @@ contract FairAuctionHouse {
             msg.sender,
             _itemName,
             _startingBid,
-            block.timestamp + _duration,
+            endTime,
+            revealTime,
             _mevProtected
         );
 
@@ -80,6 +105,7 @@ contract FairAuctionHouse {
     function placeBid(uint256 _auctionId) external payable {
         Auction storage auction = auctions[_auctionId];
 
+        require(!auction.mevProtected, "Use commitBid for MEV-protected auctions");
         require(!auction.ended, "Auction has ended");
         require(block.timestamp < auction.endTime, "Auction time expired");
         require(msg.sender != auction.seller, "Seller cannot bid");
@@ -95,7 +121,61 @@ contract FairAuctionHouse {
         auction.highestBid = msg.value;
         auction.highestBidder = msg.sender;
 
-        emit BidPlaced(_auctionId, msg.sender, msg.value, auction.mevProtected);
+        emit BidPlaced(_auctionId, msg.sender, msg.value, false);
+    }
+
+    function commitBid(uint256 _auctionId, bytes32 _commitment) external payable {
+        Auction storage auction = auctions[_auctionId];
+
+        require(auction.mevProtected, "Use placeBid for normal auctions");
+        require(!auction.ended, "Auction has ended");
+        require(block.timestamp < auction.endTime, "Commit phase expired");
+        require(msg.sender != auction.seller, "Seller cannot bid");
+        require(msg.value >= auction.startingBid, "Deposit must be at least starting bid");
+        require(commitments[_auctionId][msg.sender].commitment == bytes32(0), "Already committed");
+
+        commitments[_auctionId][msg.sender] = CommittedBid({
+            commitment: _commitment,
+            deposit: msg.value,
+            revealed: false
+        });
+
+        emit BidCommitted(_auctionId, msg.sender, _commitment);
+    }
+
+    function revealBid(uint256 _auctionId, uint256 _amount, string memory _secret) external {
+        Auction storage auction = auctions[_auctionId];
+        CommittedBid storage committedBid = commitments[_auctionId][msg.sender];
+
+        require(auction.mevProtected, "Not an MEV-protected auction");
+        require(!auction.ended, "Auction has ended");
+        require(block.timestamp >= auction.endTime, "Reveal phase not started");
+        require(block.timestamp < auction.revealTime, "Reveal phase expired");
+        require(committedBid.commitment != bytes32(0), "No commitment found");
+        require(!committedBid.revealed, "Already revealed");
+
+        bytes32 hash = keccak256(abi.encodePacked(_amount, _secret, msg.sender));
+        require(hash == committedBid.commitment, "Invalid reveal");
+
+        committedBid.revealed = true;
+
+        if (_amount > auction.highestBid && _amount >= auction.startingBid && _amount <= committedBid.deposit) {
+            if (auction.highestBidder != address(0)) {
+                pendingReturns[_auctionId][auction.highestBidder] += auction.highestBid;
+            }
+
+            auction.highestBid = _amount;
+            auction.highestBidder = msg.sender;
+
+            uint256 refund = committedBid.deposit - _amount;
+            if (refund > 0) {
+                pendingReturns[_auctionId][msg.sender] += refund;
+            }
+
+            emit BidRevealed(_auctionId, msg.sender, _amount);
+        } else {
+            pendingReturns[_auctionId][msg.sender] += committedBid.deposit;
+        }
     }
 
     function withdraw(uint256 _auctionId) external {
@@ -112,7 +192,12 @@ contract FairAuctionHouse {
         Auction storage auction = auctions[_auctionId];
 
         require(!auction.ended, "Auction already ended");
-        require(block.timestamp >= auction.endTime, "Auction not yet ended");
+
+        if (auction.mevProtected) {
+            require(block.timestamp >= auction.revealTime, "Reveal phase not ended");
+        } else {
+            require(block.timestamp >= auction.endTime, "Auction not yet ended");
+        }
 
         auction.ended = true;
 
@@ -132,6 +217,7 @@ contract FairAuctionHouse {
         uint256 highestBid,
         address highestBidder,
         uint256 endTime,
+        uint256 revealTime,
         bool ended,
         bool mevProtected
     ) {
@@ -144,9 +230,19 @@ contract FairAuctionHouse {
             auction.highestBid,
             auction.highestBidder,
             auction.endTime,
+            auction.revealTime,
             auction.ended,
             auction.mevProtected
         );
+    }
+
+    function getCommitment(uint256 _auctionId, address _bidder) external view returns (
+        bytes32 commitment,
+        uint256 deposit,
+        bool revealed
+    ) {
+        CommittedBid memory bid = commitments[_auctionId][_bidder];
+        return (bid.commitment, bid.deposit, bid.revealed);
     }
 
     function getPendingReturn(uint256 _auctionId, address _bidder) external view returns (uint256) {

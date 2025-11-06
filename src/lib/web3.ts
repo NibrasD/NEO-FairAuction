@@ -12,17 +12,22 @@ export const NEO_X_MAINNET = {
   blockExplorerUrls: ['https://xexplorer.neo.org'],
 };
 
-export const CONTRACT_ADDRESS = '0x0E450e769dB21D7d33EE8e36495b229EA7574519';
+export const CONTRACT_ADDRESS = '0x3256e67769bac151A2b23F15115ADB04462ea797';
 
 export const CONTRACT_ABI = [
   'function createAuction(string memory _itemName, string memory _description, uint256 _startingBid, uint256 _duration, bool _mevProtected) external returns (uint256)',
   'function placeBid(uint256 _auctionId) external payable',
+  'function commitBid(uint256 _auctionId, bytes32 _commitment) external payable',
+  'function revealBid(uint256 _auctionId, uint256 _amount, string memory _secret) external',
   'function endAuction(uint256 _auctionId) external',
-  'function getAuction(uint256 _auctionId) external view returns (address seller, string memory itemName, string memory description, uint256 startingBid, uint256 highestBid, address highestBidder, uint256 endTime, bool ended, bool mevProtected)',
+  'function getAuction(uint256 _auctionId) external view returns (address seller, string memory itemName, string memory description, uint256 startingBid, uint256 highestBid, address highestBidder, uint256 endTime, uint256 revealTime, bool ended, bool mevProtected)',
+  'function getCommitment(uint256 _auctionId, address _bidder) external view returns (bytes32 commitment, uint256 deposit, bool revealed)',
   'function withdraw(uint256 _auctionId) external',
   'function auctionCount() external view returns (uint256)',
-  'event AuctionCreated(uint256 indexed auctionId, address indexed seller, string itemName, uint256 startingBid, uint256 endTime, bool mevProtected)',
+  'event AuctionCreated(uint256 indexed auctionId, address indexed seller, string itemName, uint256 startingBid, uint256 endTime, uint256 revealTime, bool mevProtected)',
   'event BidPlaced(uint256 indexed auctionId, address indexed bidder, uint256 amount, bool mevProtected)',
+  'event BidCommitted(uint256 indexed auctionId, address indexed bidder, bytes32 commitment)',
+  'event BidRevealed(uint256 indexed auctionId, address indexed bidder, uint256 amount)',
   'event AuctionEnded(uint256 indexed auctionId, address winner, uint256 amount)',
 ];
 
@@ -97,19 +102,53 @@ export async function sendMEVProtectedTransaction(
 
   const contractWithSigner = contract.connect(signer);
 
-  const txOptions: any = {
-    type: 2,
-    maxPriorityFeePerGas: ethers.parseUnits('1', 'gwei'),
-    maxFeePerGas: ethers.parseUnits('50', 'gwei'),
-  };
+  const txOptions: any = {};
 
   if (value) {
     txOptions.value = value;
   }
 
+  try {
+    const gasEstimate = await contractWithSigner[method].estimateGas(...params, txOptions);
+    console.log('Gas estimate:', gasEstimate.toString());
+    txOptions.gasLimit = gasEstimate * 120n / 100n;
+  } catch (error: any) {
+    console.error('Gas estimation failed:', error);
+    throw new Error('Transaction would fail: ' + (error.reason || error.message));
+  }
+
+  const feeData = await signer.provider.getFeeData();
+  console.log('Fee data:', {
+    gasPrice: feeData.gasPrice?.toString(),
+    maxFeePerGas: feeData.maxFeePerGas?.toString(),
+    maxPriorityFeePerGas: feeData.maxPriorityFeePerGas?.toString()
+  });
+
+  txOptions.type = 0;
+  if (feeData.gasPrice) {
+    txOptions.gasPrice = feeData.gasPrice;
+  } else {
+    txOptions.gasPrice = ethers.parseUnits('20', 'gwei');
+  }
+
+  console.log('Sending transaction with options:', txOptions);
   const tx = await contractWithSigner[method](...params, txOptions);
+  console.log('Transaction sent:', tx.hash);
 
   return tx.wait();
+}
+
+export function createBidCommitment(amount: string, secret: string, bidderAddress: string): string {
+  const amountWei = ethers.parseEther(amount);
+  const hash = ethers.solidityPackedKeccak256(
+    ['uint256', 'string', 'address'],
+    [amountWei, secret, bidderAddress]
+  );
+  return hash;
+}
+
+export function generateSecret(): string {
+  return ethers.hexlify(ethers.randomBytes(32));
 }
 
 declare global {
