@@ -462,15 +462,4 @@ This project is submitted for **Neo X GrantShares GS-004: Make It Make Sense - B
 
 ---
 
-## Contact
-
-For questions or support, reach out via:
-- GitHub Issues
-- Discord: [Your Handle]
-- Email: [Your Email]
-
-Built with ❤️ for the Neo X ecosystem
-
----
-
 **Note**: This is an educational demonstration. Neo X provides built-in MEV resistance through its dBFT 2.0 consensus mechanism at the protocol level. This project demonstrates application-level MEV protection using commit-reveal patterns, which can be used alongside or independently of protocol-level protections.
