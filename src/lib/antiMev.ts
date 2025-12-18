@@ -1,46 +1,97 @@
 import { ethers } from 'ethers';
-import { TpkePublicKey as PublicKey } from './neox-lib';
+import { TpkePublicKey } from './neox-lib';
 
-// Constants
+// Neo X Mainnet Contract Addresses
 export const NEO_X_AMEV_RPC = 'https://mainnet-5.rpc.banelabs.org';
-export const DKG_CONTRACT_ADDRESS = '0x1212000000000000000000000000000000000002';
-// GovReward contract is the recipient of Envelope Transactions
-export const GOV_REWARD_CONTRACT_ADDRESS = '0x1212000000000000000000000000000000000003';
-export const TPKE_PUBLIC_KEY_HEX = '0xa5aa188d1c60a7173e59fe49b68b969999e70aa4c1acb76c5a3dd2ad0d19a859b1a2759e3995ce1ceccdea5a57fbf637';
+export const GOVERNANCE_CONTRACT = '0x1212000000000000000000000000000000000001';
+export const GOV_REWARD_CONTRACT = '0x1212000000000000000000000000000000000003';
+export const KEY_MANAGEMENT_CONTRACT = '0x1212000000000000000000000000000000000008';
 
-const DKG_ABI = [
-  'function currentRound() external view returns (uint256)',
+// Contract ABIs (minimal required functions)
+const GOVERNANCE_ABI = [
+  'function consensusSize() external view returns (uint256)'
+];
+
+const KEY_MANAGEMENT_ABI = [
+  'function roundNumber() external view returns (uint256)',
+  'function aggregatedCommitments(uint256 round) external view returns (bytes)'
 ];
 
 /**
- * Fetch the current DKG round (epoch).
+ * Get the consensus size from the Governance contract.
  */
-export async function getDkgRound(providerRpcUrl: string = NEO_X_AMEV_RPC): Promise<number> {
+export async function getConsensusSize(providerRpcUrl: string = NEO_X_AMEV_RPC): Promise<number> {
   const provider = new ethers.JsonRpcProvider(providerRpcUrl);
-  const dkgContract = new ethers.Contract(DKG_CONTRACT_ADDRESS, DKG_ABI, provider);
-  const currentRound = await dkgContract.currentRound();
-  return Number(currentRound);
+  const contract = new ethers.Contract(GOVERNANCE_CONTRACT, GOVERNANCE_ABI, provider);
+  const size = await contract.consensusSize();
+  return Number(size);
 }
 
 /**
- * Encrypts a signed transaction using TPKE.
+ * Get the current round number from the KeyManagement contract.
  */
-export function encryptSignedTransaction(signedTx: string): { encryptedKey: Uint8Array; encryptedMsg: Uint8Array } {
-  const publicKeyBytes = ethers.getBytes(TPKE_PUBLIC_KEY_HEX);
-  const publicKey = PublicKey.fromBytes(publicKeyBytes);
-  const msgBytes = ethers.getBytes(signedTx);
+export async function getRoundNumber(providerRpcUrl: string = NEO_X_AMEV_RPC): Promise<number> {
+  const provider = new ethers.JsonRpcProvider(providerRpcUrl);
+  const contract = new ethers.Contract(KEY_MANAGEMENT_CONTRACT, KEY_MANAGEMENT_ABI, provider);
+  const round = await contract.roundNumber();
+  return Number(round);
+}
+
+/**
+ * Get the aggregated commitment for a specific round.
+ */
+export async function getAggregatedCommitment(
+  round: number,
+  providerRpcUrl: string = NEO_X_AMEV_RPC
+): Promise<string> {
+  const provider = new ethers.JsonRpcProvider(providerRpcUrl);
+  const contract = new ethers.Contract(KEY_MANAGEMENT_CONTRACT, KEY_MANAGEMENT_ABI, provider);
+  const commitment = await contract.aggregatedCommitments(round);
+  return commitment;
+}
+
+/**
+ * Calculate the threshold from consensus size.
+ * Formula: ceil(2 * n / 3)
+ */
+export function calculateThreshold(consensusSize: number): number {
+  return Math.ceil((2 * consensusSize) / 3);
+}
+
+/**
+ * Encrypts a signed transaction using TPKE with the aggregated commitment.
+ */
+export async function encryptTransaction(
+  signedTxBytes: Uint8Array,
+  providerRpcUrl: string = NEO_X_AMEV_RPC
+): Promise<{ encryptedKey: Uint8Array; encryptedMsg: Uint8Array; roundNumber: number }> {
+  // Get TPKE parameters from contracts
+  const consensusSize = await getConsensusSize(providerRpcUrl);
+  const roundNumber = await getRoundNumber(providerRpcUrl);
+  const aggregatedCommitment = await getAggregatedCommitment(roundNumber, providerRpcUrl);
+
+  console.log('TPKE params:', { consensusSize, roundNumber, threshold: calculateThreshold(consensusSize) });
+
+  // Create public key from aggregated commitment
+  const threshold = calculateThreshold(consensusSize);
+  const publicKey = TpkePublicKey.fromAggregatedCommitment(
+    ethers.getBytes(aggregatedCommitment),
+    consensusSize,
+    threshold
+  );
 
   // Encrypt the transaction
-  const { encryptedKey, encryptedMsg } = publicKey.encrypt(msgBytes);
-  return { encryptedKey, encryptedMsg };
+  const { encryptedKey, encryptedMsg } = publicKey.encrypt(signedTxBytes);
+
+  return { encryptedKey, encryptedMsg, roundNumber };
 }
 
 /**
- * Constructs the data payload for an Envelope Transaction.
- * Format: prefix(4) | epoch(4-BE) | gaslimit(4-BE) | txHash(32) | encryptedKey | encryptedMsg
+ * Constructs the envelope data payload.
+ * Format: prefix(4) | round(4-BE) | gaslimit(4-BE) | txHash(32) | encryptedKey | encryptedMsg
  */
 export function constructEnvelopeData(
-  epoch: number,
+  roundNumber: number,
   innerTxGasLimit: number,
   innerTxHash: string,
   encryptedKey: Uint8Array,
@@ -49,17 +100,14 @@ export function constructEnvelopeData(
   // 1. Prefix: 0xffffffff
   const prefix = new Uint8Array([0xff, 0xff, 0xff, 0xff]);
 
-  // 2. Epoch: 4 bytes Big Endian
-  // ethers.zeroPadValue pads to the left (Big Endian standard for numbers)
-  // But we need to ensure it's exactly 4 bytes.
-  // Using DataView for precise control over Endianness
-  const epochBuffer = new ArrayBuffer(4);
-  new DataView(epochBuffer).setUint32(0, epoch, false); // false = Big Endian
-  const epochBytes = new Uint8Array(epochBuffer);
+  // 2. Round number: 4 bytes Big Endian
+  const roundBuffer = new ArrayBuffer(4);
+  new DataView(roundBuffer).setUint32(0, roundNumber, false); // false = Big Endian
+  const roundBytes = new Uint8Array(roundBuffer);
 
   // 3. GasLimit: 4 bytes Big Endian
   const gasLimitBuffer = new ArrayBuffer(4);
-  new DataView(gasLimitBuffer).setUint32(0, innerTxGasLimit, false); // false = Big Endian
+  new DataView(gasLimitBuffer).setUint32(0, innerTxGasLimit, false);
   const gasLimitBytes = new Uint8Array(gasLimitBuffer);
 
   // 4. Inner Tx Hash: 32 bytes
@@ -68,7 +116,7 @@ export function constructEnvelopeData(
   // Concatenate all parts
   const envelopeData = ethers.concat([
     prefix,
-    epochBytes,
+    roundBytes,
     gasLimitBytes,
     txHashBytes,
     encryptedKey,
@@ -79,54 +127,26 @@ export function constructEnvelopeData(
 }
 
 /**
- * Full helper to prepare an Envelope Transaction.
+ * Get cached transaction from the Anti-MEV RPC.
  */
-export async function prepareEnvelopeTransaction(
-  signer: ethers.Signer,
-  innerTx: ethers.TransactionRequest,
-  innerTxGasLimit: number = 500000
-): Promise<ethers.TransactionRequest> {
-  // 1. Get Epoch
-  const epoch = await getDkgRound();
+export async function getCachedTransaction(
+  nonce: number,
+  signature: string,
+  providerRpcUrl: string = NEO_X_AMEV_RPC
+): Promise<string | null> {
+  const provider = new ethers.JsonRpcProvider(providerRpcUrl);
 
-  // 2. Prepare Inner Tx (populate nonce, chainId, etc)
-  const populatedTx = await signer.populateTransaction(innerTx);
+  // Convert nonce to hex (as shown in the working example)
+  const nonceHex = ethers.toBeHex(nonce);
 
-  // Ensure gas vars are set for inner tx simulation/validity if needed, 
-  // but for the envelope payload we use the signed raw tx.
-  // We need to sign this inner transaction.
-  // But wait, the inner transaction nonce must match the envelope transaction nonce.
-  // The user steps say:
-  // "The nonce must be identical to that of the inner secret transactions."
+  console.log('Fetching cached transaction:', { nonceHex, signature });
 
-  if (!populatedTx.nonce) {
-    const nonce = await signer.getNonce('pending');
-    populatedTx.nonce = nonce;
+  try {
+    const cachedTx = await provider.send('eth_getCachedTransaction', [nonceHex, signature]);
+    console.log('Cached transaction retrieved:', cachedTx ? 'success' : 'null');
+    return cachedTx;
+  } catch (error) {
+    console.error('Error fetching cached transaction:', error);
+    return null;
   }
-
-  // Sign the inner transaction
-  // ethers v6: signer.signTransaction(populatedTx)
-  const signedInnerTx = await signer.signTransaction(populatedTx);
-  const innerTxHash = ethers.keccak256(signedInnerTx);
-
-  // 3. Encrypt
-  const { encryptedKey, encryptedMsg } = encryptSignedTransaction(signedInnerTx);
-
-  // 4. Construct Payload
-  const data = constructEnvelopeData(epoch, innerTxGasLimit, innerTxHash, encryptedKey, encryptedMsg);
-
-  // 5. Construct Envelope Tx
-  const envelopeTx: ethers.TransactionRequest = {
-    to: GOV_REWARD_CONTRACT_ADDRESS,
-    from: await signer.getAddress(),
-    data: data,
-    value: 0, // Envelopes usually don't carry value to the GovContract itself, unless paying fee? 
-    // The dock says "The gas tip must exceed the network's minGasTipCap plus envelopeFee".
-    // Paying execution GAS is handled via the fallback.
-    nonce: populatedTx.nonce, // MUST MATCH INNER NONCE
-    gasLimit: BigInt(innerTxGasLimit) + 200000n, // Envelope overhead
-    type: 0 // Legacy or EIP-1559? Neo X supports both.
-  };
-
-  return envelopeTx;
 }

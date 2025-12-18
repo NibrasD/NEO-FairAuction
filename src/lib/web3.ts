@@ -1,11 +1,10 @@
 import { ethers } from 'ethers';
 import {
-  encryptSignedTransaction,
+  encryptTransaction,
   constructEnvelopeData,
-  getDkgRound,
+  getCachedTransaction,
   NEO_X_AMEV_RPC,
-  GOV_REWARD_CONTRACT_ADDRESS,
-  DKG_CONTRACT_ADDRESS
+  GOV_REWARD_CONTRACT
 } from './antiMev';
 
 export const NEO_X_CHAIN_ID = 47763;
@@ -98,8 +97,8 @@ export function getContract(provider: ethers.BrowserProvider) {
 }
 
 /**
- * Main function to send an Anti-MEV transaction.
- * Follows the compatible flow: Cache -> Sign Nonce -> Fetch Signed Tx -> Encrypt -> Send Envelope.
+ * Main function to send an Anti-MEV protected transaction.
+ * Follows the correct Neo X envelope flow based on official examples.
  */
 export async function sendMEVProtectedTransaction(
   contract: ethers.Contract,
@@ -118,76 +117,98 @@ export async function sendMEVProtectedTransaction(
   const signerAddress = await signer.getAddress();
   const antiMevProvider = new ethers.JsonRpcProvider(NEO_X_AMEV_RPC);
 
-  // --- Step 1 & 2: Build and Cahce (Send to fail) ---
-  // We use the helper to trigger the "failed" send which caches the tx in the node.
-  const { nonce } = await buildAndCacheTransaction(contract, method, params, value, actualProvider);
+  // Step 1: Get nonce from Anti-MEV RPC
+  console.log('Step 1: Getting transaction nonce');
+  const nonce = await antiMevProvider.getTransactionCount(signerAddress, 'pending');
+  console.log('✓ Nonce:', nonce);
 
-  // --- Step 3: Sign the Nonce ---
-  console.log('Step 3: Sign the nonce to prove ownership');
-  // The message to sign is just the nonce as a string? Or is it specific?
-  // Docs say: "Request the wallet to sign the nonce of the secret transaction as a message"
-  // Usually this means signing the string representation or the bytes?
-  // Based on common practices and the previous code example (which seemed confused), 
-  // let's assume it's the stringified nonce or similar. 
-  // NOTE: The example code I replaced was `signer.signMessage(ethers.getBytes(txHash))`. 
-  // But the doc says "sign the nonce".
-  // Let's try signing the decimal string of the nonce.
-  const nonceMsg = nonce.toString();
-  const signature = await signer.signMessage(nonceMsg);
-  console.log('✓ Nonce signed');
+  // Step 2: Build and send transaction (will be cached, may error - expected)
+  console.log('Step 2: Sending transaction to cache');
+  const contractWithSigner = contract.connect(signer);
+  const txData = contractWithSigner.interface.encodeFunctionData(method, params);
 
-  // --- Step 4: Fetch Signed Transaction ---
-  console.log('Step 4: Fetch signed transaction from cache');
-  const signedTx = await getCachedTransaction(nonce, signature); // Modified to take nonce
-  if (!signedTx) {
-    throw new Error('Failed to retrieve signed transaction from cache');
+  const feeData = await actualProvider.getFeeData();
+  const gasLimit = 500000;
+
+  const tx = {
+    to: contract.target as string,
+    data: txData,
+    value: value || '0',
+    nonce: nonce,
+    gasLimit: gasLimit,
+    gasPrice: feeData.gasPrice || ethers.parseUnits('40', 'gwei'),
+  };
+
+  try {
+    const txResponse = await signer.sendTransaction(tx);
+    console.log('Transaction sent (unexpected success):', txResponse.hash);
+  } catch (error: any) {
+    // Expected - transaction should be cached but rejected
+    console.log('✓ Transaction cached for AntiMEV processing');
   }
 
-  // --- Step 5: Encrypt ---
-  console.log('Step 5: Encrypt transaction');
-  const { encryptedKey, encryptedMsg } = encryptSignedTransaction(signedTx);
+  // Step 3: Sign the nonce as a message
+  console.log('Step 3: Signing nonce message');
+  const signature = await signer.signMessage(nonce.toString());
+  console.log('✓ Signature obtained');
 
-  // --- Step 6: Construct Envelope ---
-  console.log('Step 6: Construct Envelope');
-  const epoch = await getDkgRound();
-  // Estimate gas limit for the inner tx. We can use the cached gas limit or a safe default.
-  // We'll use 500,000 as a safe buffer for now.
-  const innerGasLimit = 500000;
+  // Step 4: Fetch the cached signed transaction
+  console.log('Step 4: Retrieving cached transaction');
+  const signedTx = await getCachedTransaction(nonce, signature, NEO_X_AMEV_RPC);
 
-  // Hash the inner signed transaction
+  if (!signedTx) {
+    throw new Error('Failed to retrieve cached transaction. The transaction may not have been cached properly.');
+  }
+  console.log('✓ Cached transaction retrieved');
+
+  // Step 5: Encrypt the transaction
+  console.log('Step 5: Encrypting transaction with TPKE');
+  const signedTxBytes = ethers.getBytes(signedTx);
+  const { encryptedKey, encryptedMsg, roundNumber } = await encryptTransaction(signedTxBytes, NEO_X_AMEV_RPC);
+  console.log('✓ Transaction encrypted', {
+    encryptedKeyLen: encryptedKey.length,
+    encryptedMsgLen: encryptedMsg.length,
+    roundNumber
+  });
+
+  // Step 6: Construct the envelope
+  console.log('Step 6: Creating transaction envelope');
   const innerTxHash = ethers.keccak256(signedTx);
-
   const envelopeData = constructEnvelopeData(
-    epoch,
-    innerGasLimit,
+    roundNumber,
+    gasLimit,
     innerTxHash,
     encryptedKey,
     encryptedMsg
   );
+  console.log('✓ Envelope created, size:', envelopeData.length / 2 - 1, 'bytes');
 
-  // --- Step 7: Send Envelope ---
-  console.log('Step 7: Send Envelope to GovReward Contract');
-  const feeData = await actualProvider.getFeeData();
-  const gasPrice = feeData.gasPrice || ethers.parseUnits('40', 'gwei');
-
+  // Step 7: Send the envelope transaction
+  console.log('Step 7: Submitting envelope to GovReward contract');
   const envelopeTx = {
-    to: GOV_REWARD_CONTRACT_ADDRESS,
+    to: GOV_REWARD_CONTRACT,
     from: signerAddress,
     data: envelopeData,
-    gasLimit: BigInt(innerGasLimit) + 200000n, // Overhead
-    gasPrice: gasPrice,
+    nonce: nonce, // MUST match inner tx nonce
+    gasLimit: BigInt(gasLimit) + 200000n, // Extra for envelope overhead
+    gasPrice: feeData.gasPrice || ethers.parseUnits('40', 'gwei'),
     type: 0,
-    nonce: nonce // Envelope Nonce MUST match Inner Nonce
   };
 
   const txResponse = await signer.sendTransaction(envelopeTx);
   console.log('✓ Envelope submitted:', txResponse.hash);
 
+  // Step 8: Wait for confirmation
+  console.log('Step 8: Waiting for confirmation');
   const receipt = await txResponse.wait(1);
-  console.log('✅ Envelope confirmed! Bid placed.');
+  console.log('✅ Anti-MEV transaction confirmed!', receipt?.hash);
+
   return receipt;
 }
 
+/**
+ * Send a regular (non-MEV-protected) transaction.
+ */
 export async function sendRegularTransaction(
   contract: ethers.Contract,
   method: string,
@@ -227,127 +248,3 @@ export function createBidCommitment(amount: string, secret: string, bidderAddres
 export function generateSecret(): string {
   return ethers.hexlify(ethers.randomBytes(32));
 }
-
-export async function getCachedTransaction(
-  nonce: number,
-  signature: string
-): Promise<string | null> {
-  try {
-    console.log('=== Retrieving Cached Transaction ===');
-    const antiMevProvider = new ethers.JsonRpcProvider(NEO_X_AMEV_RPC);
-
-    // The method signature in docs is `eth_getCachedTransaction`.
-    // It requires "valid sender signature". 
-    // Usually arguments are [address, nonce, signature] or similar?
-    // Doc says: "Request the wallet to sign the nonce ... as a message; Use this signature".
-    // It doesn't specify the exact JSON-RPC params order.
-    // However, looking at the previous file structure, it was passing `[txHash, signature]`.
-    // But sending `txHash` implies we know the hash.
-    // Ideally we pass `[nonce, signature]` or something.
-    // Let's assume the previous code `[txHash, signature]` was a guess.
-    // If we assume standard Neo X behavior, maybe it needs `[address, nonceVal, signature]`?
-    // Let's try `[nonceHex, signature]`.
-
-    // Note: The previous code commented "It requires a valid sender signature in parameters".
-    // I will try passing `[txHash, signature]` IF we have the hash.
-    // But the `buildAndCacheTransaction` computes the likely `txHash`.
-    // Let's pass `[txHash, signature]` as per the previous implementation attempt, hoping it was based on *something* correct, 
-    // OR try to find specs. 
-    // Since I can't find specs, I'll stick to `[txHash, signature]` but I need `txHash`.
-    // `buildAndCache` returns `txHash`.
-
-    // Let's recalculate the txHash from nonce? No, we need the exact hash.
-    // `buildAndCache` returns `txHash` (calculated as keccak(nonce)?? No that's wrong).
-    // The previous code `txHash: ethers.solidityPackedKeccak256(['uint256'], [nonce])` was definitely placeholder/wrong.
-
-    // Let's try to ask the RPC for help or assume parameters are `[signedMessage]`?
-    // Actually, `eth_getCachedTransaction` likely takes the signature and looks up the tx.
-    // Parameters: `[signature]`. Or `[address, signature]`.
-
-    // I'll stick to the parameters `[signature]` since the signature contains the signed nonce, verifying ownership.
-    // Wait, I'll pass `[signature]` only.
-
-    const cachedTx = await antiMevProvider.send('eth_getCachedTransaction', [
-      signature
-    ]);
-
-    if (cachedTx) {
-      console.log('✓ Cached transaction retrieved successfully');
-      return cachedTx;
-    } else {
-      console.warn('⚠ No cached transaction found');
-      return null;
-    }
-  } catch (error) {
-    console.error('Error retrieving cached transaction:', error);
-    return null;
-  }
-}
-
-export async function buildAndCacheTransaction(
-  contract: ethers.Contract,
-  method: string,
-  params: any[],
-  value?: string,
-  provider?: ethers.BrowserProvider
-): Promise<{ nonce: number; txHash: string }> {
-  console.log('=== Step 1: Build Transaction and Attempt Send ===');
-
-  const actualProvider = provider || (contract.runner?.provider as ethers.BrowserProvider);
-  if (!actualProvider) throw new Error('No provider available');
-
-  const signer = await actualProvider.getSigner();
-  const signerAddress = await signer.getAddress();
-  const antiMevProvider = new ethers.JsonRpcProvider(NEO_X_AMEV_RPC);
-
-  const contractWithSigner = contract.connect(signer);
-  const feeData = await actualProvider.getFeeData();
-  const gasLimit = 500000;
-  const gasPrice = feeData.gasPrice || ethers.parseUnits('40', 'gwei');
-
-  const txData = contractWithSigner.interface.encodeFunctionData(method, params);
-  const nonce = await antiMevProvider.getTransactionCount(signerAddress, 'pending');
-
-  console.log('Building transaction with nonce:', nonce);
-
-  // We need to send this via the Signer (Metamask) to the Node.
-  // The Node must be `NEO_X_AMEV_RPC`.
-  // Metamask is connected to `actualProvider`. 
-  // IMPORTANT: The user must be connected to the Anti-MEV RPC in Metamask for this to work natively?
-  // OR we rely on the fact that we can't force Metamask RPC, so we just send it.
-  // If Metamask is connected to a different RPC, `eth_sendTransaction` goes there.
-  // The User Instructions said: "send it to nodes configured with --txpool.amevcache".
-  // This implies the USER MUST BE CONNECTED TO THE SPECIAL RPC in Metamask.
-  // `connectWallet` checks specific Chain ID.
-  // `NEO_X_AMEV_RPC` is `https://mainnet-5.rpc.banelabs.org`.
-  // The `NEO_X_MAINNET` object uses this RPC.
-  // So if `connectWallet` succeeded, Metamask is using the Anti-MEV RPC.
-
-  const tx: any = {
-    to: contract.target as string,
-    data: txData,
-    value: value || '0',
-    // We let Metamask handle gas/nonce usually, but for this specific flow we need the nonce.
-    // If we specify nonce in Metamask send, it works.
-    nonce: nonce
-  };
-
-  try {
-    const txResponse = await signer.sendTransaction(tx);
-    // If it succeeds (shouldn't if node rejects it), we get a hash.
-    return { nonce, txHash: txResponse.hash };
-  } catch (error: any) {
-    const errorMsg = error.message || String(error);
-    console.log('Transaction send outcome:', errorMsg);
-
-    // We expect failure or weirdness.
-    // But we need the tx to be in the cache.
-    // If the node rejects it with "Anti-MEV flow initiated" or similar, good.
-    // If it just silently fails, we hope it's cached.
-
-    // We'll return the nonce we used.
-    // We assume the hash is unknown/irrelevant if we fetch by signature.
-    return { nonce, txHash: '' };
-  }
-}
-
