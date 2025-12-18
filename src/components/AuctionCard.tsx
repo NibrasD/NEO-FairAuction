@@ -51,7 +51,7 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
           // If contract returns 0, ignore it and fall back to DB time
           if (auctionRevealTime < 1700000000000) {
             console.warn('Invalid reveal time from chain, using fallback logic');
-            setPhase(isExpired ? 'ended' : 'active');
+            setPhase(isExpired ? 'ended' : 'commit');
             return;
           }
 
@@ -65,6 +65,7 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
           }
         } catch (error) {
           console.error('Error fetching auction phase:', error);
+          setPhase(isExpired ? 'ended' : 'commit');
         }
       } else {
         setPhase(isExpired ? 'ended' : 'active');
