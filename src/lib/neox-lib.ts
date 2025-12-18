@@ -2,9 +2,9 @@ import { bls12_381 } from '@noble/curves/bls12-381.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import aesjs from 'aes-js';
 
-// Get the generator points from the curve
-const G1 = bls12_381.G1.ProjectivePoint;
-const G2 = bls12_381.G2.ProjectivePoint;
+// Get the generator points from the curve (Note: in noble-curves v1 it's .Point)
+const G1 = bls12_381.G1.Point;
+const G2 = bls12_381.G2.Point;
 
 // Helper to convert bytes to bigint for scalar multiplication
 function bytesToBigInt(bytes: Uint8Array): bigint {
@@ -25,9 +25,9 @@ export class Ciphertext {
     toBytes(): Uint8Array {
         // Standard compressed serialization for BLS12-381
         // G1 compressed = 48 bytes, G2 compressed = 96 bytes
-        const b1 = this.cMsg.toRawBytes(true);
-        const b2 = this.bigR.toRawBytes(true);
-        const b3 = this.commitment.toRawBytes(true);
+        const b1 = this.cMsg.toBytes();
+        const b2 = this.bigR.toBytes();
+        const b3 = this.commitment.toBytes();
 
         const out = new Uint8Array(b1.length + b2.length + b3.length);
         out.set(b1, 0);
@@ -104,7 +104,7 @@ export class TpkePublicKey {
         const U = G1.BASE.multiply(r1);
 
         // Deriving the AES key from U
-        const uBytes = U.toRawBytes(false); // false = uncompressed
+        const uBytes = U.toBytes();
         const aesKey = sha256(uBytes); // 32 bytes
 
         // 3. Compute encryptedKey components
