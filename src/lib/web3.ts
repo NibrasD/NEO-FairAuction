@@ -122,29 +122,37 @@ export async function sendMEVProtectedTransaction(
   const nonce = await antiMevProvider.getTransactionCount(signerAddress, 'pending');
   console.log('✓ Nonce:', nonce);
 
-  // Step 2: Build and send transaction (will be cached, may error - expected)
-  console.log('Step 2: Sending transaction to cache');
+  // Step 2: Build, Sign, and send transaction to Anti-MEV RPC (will be cached, may error - expected)
+  console.log('Step 2: Sending transaction to Anti-MEV cache');
   const contractWithSigner = contract.connect(signer);
   const txData = contractWithSigner.interface.encodeFunctionData(method, params);
 
-  const feeData = await actualProvider.getFeeData();
+  const feeData = await antiMevProvider.getFeeData();
   const gasLimit = 500000;
+  const gasPrice = feeData.gasPrice || ethers.parseUnits('40', 'gwei');
 
+  // Build the transaction object
   const tx = {
     to: contract.target as string,
     data: txData,
-    value: value || '0',
+    value: value ? BigInt(value) : 0n,
     nonce: nonce,
     gasLimit: gasLimit,
-    gasPrice: feeData.gasPrice || ethers.parseUnits('40', 'gwei'),
+    gasPrice: gasPrice,
+    chainId: NEO_X_CHAIN_ID,
   };
 
+  // Sign the transaction locally
+  const signedTxRaw = await signer.signTransaction(tx);
+  console.log('✓ Transaction signed locally');
+
+  // Send the signed transaction to Anti-MEV RPC directly
   try {
-    const txResponse = await signer.sendTransaction(tx);
-    console.log('Transaction sent (unexpected success):', txResponse.hash);
+    await antiMevProvider.send('eth_sendRawTransaction', [signedTxRaw]);
+    console.log('Transaction sent to Anti-MEV RPC (unexpected success)');
   } catch (error: any) {
-    // Expected - transaction should be cached but rejected
-    console.log('✓ Transaction cached for AntiMEV processing');
+    // Expected - transaction should be cached but rejected by Anti-MEV RPC
+    console.log('✓ Transaction cached for AntiMEV processing (expected error)');
   }
 
   // Step 3: Sign the nonce as a message
