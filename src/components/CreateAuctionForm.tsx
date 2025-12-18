@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Plus, Shield, ShieldOff } from 'lucide-react';
 import { ethers } from 'ethers';
-import { getContract, sendMEVProtectedTransaction } from '../lib/web3';
+import { getContract, sendMEVProtectedTransaction, sendRegularTransaction } from '../lib/web3';
 import { supabase } from '../lib/supabase';
 
 interface CreateAuctionFormProps {
@@ -45,17 +45,20 @@ export function CreateAuctionForm({ provider, onAuctionCreated }: CreateAuctionF
         mevProtected: formData.mevProtected,
       });
 
-      const tx = await contractWithSigner.createAuction(
-        formData.itemName,
-        formData.description,
-        startingBidWei,
-        durationSeconds,
-        formData.mevProtected
+      // Use sendRegularTransaction to ensure it forces Standard RPC
+      const receipt = await sendRegularTransaction(
+        contract,
+        'createAuction',
+        [
+          formData.itemName,
+          formData.description,
+          startingBidWei,
+          durationSeconds,
+          formData.mevProtected
+        ]
       );
 
-      console.log('Transaction sent:', tx.hash);
-      const receipt = await tx.wait();
-      console.log('Transaction confirmed:', receipt);
+      console.log('Transaction confirmed:', receipt.hash);
 
       const auctionCreatedEvent = receipt.logs.find((log: any) => {
         try {

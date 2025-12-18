@@ -7,6 +7,7 @@ import {
   GOV_REWARD_CONTRACT
 } from './antiMev';
 
+export const NEO_X_STANDARD_RPC = 'https://mainnet-1.rpc.banelabs.org';
 export const NEO_X_CHAIN_ID = 47763;
 
 export const NEO_X_MAINNET = {
@@ -17,7 +18,7 @@ export const NEO_X_MAINNET = {
     symbol: 'GAS',
     decimals: 18,
   },
-  rpcUrls: [NEO_X_AMEV_RPC],
+  rpcUrls: [NEO_X_STANDARD_RPC],
   blockExplorerUrls: ['https://xexplorer.neo.org'],
 };
 
@@ -62,7 +63,6 @@ export async function connectWallet(): Promise<ethers.BrowserProvider | null> {
           params: [{ chainId: NEO_X_MAINNET.chainId }],
         });
       } catch (switchError: any) {
-        // This error code indicates that the chain has not been added to MetaMask.
         if (switchError.code === 4902) {
           try {
             await window.ethereum.request({
@@ -82,7 +82,6 @@ export async function connectWallet(): Promise<ethers.BrowserProvider | null> {
       }
     } else {
       // Even if on the right chain, ensure we are using the Standard RPC
-      // This allows switching back from Anti-MEV RPC if previously configured
       try {
         await window.ethereum.request({
           method: 'wallet_addEthereumChain',
@@ -93,11 +92,8 @@ export async function connectWallet(): Promise<ethers.BrowserProvider | null> {
       }
     }
 
-    // specific provider with the new config
     const newProvider = new ethers.BrowserProvider(window.ethereum);
     return newProvider;
-
-    return provider;
   } catch (error) {
     console.error('Error connecting wallet:', error);
     alert('Error connecting wallet. Please try again.');
@@ -107,6 +103,28 @@ export async function connectWallet(): Promise<ethers.BrowserProvider | null> {
 
 export function getContract(provider: ethers.BrowserProvider) {
   return new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
+}
+
+/**
+ * Switch wallet to the specified network RPC
+ */
+export async function ensureNetwork(type: 'STANDARD' | 'ANTIMEV'): Promise<void> {
+  const targetRPC = type === 'STANDARD' ? NEO_X_STANDARD_RPC : NEO_X_AMEV_RPC;
+  const chainConfig = {
+    ...NEO_X_MAINNET,
+    rpcUrls: [targetRPC],
+  };
+
+  try {
+    // Force add/switch to update RPC URL even if chainId is the same
+    await window.ethereum.request({
+      method: 'wallet_addEthereumChain',
+      params: [chainConfig],
+    });
+  } catch (error) {
+    console.error(`Failed to switch to ${type} RPC:`, error);
+    throw new Error(`Please switch your wallet network to use ${type === 'STANDARD' ? 'Standard' : 'Anti-MEV'} RPC.`);
+  }
 }
 
 /**
@@ -121,12 +139,13 @@ export async function sendMEVProtectedTransaction(
   provider?: ethers.BrowserProvider
 ): Promise<any> {
   console.log('=== Neo X Anti-MEV Envelope Flow ===');
-  console.log('Method:', method, 'Params:', params, 'Value:', value);
 
-  const actualProvider = provider || (contract.runner?.provider as ethers.BrowserProvider);
-  if (!actualProvider) throw new Error('No provider available');
+  // Enforce Anti-MEV Network Connection
+  await ensureNetwork('ANTIMEV');
 
-  const signer = await actualProvider.getSigner();
+  // Re-initialize provider/signer after network switch
+  const freshProvider = new ethers.BrowserProvider(window.ethereum);
+  const signer = await freshProvider.getSigner();
   const signerAddress = await signer.getAddress();
   const antiMevProvider = new ethers.JsonRpcProvider(NEO_X_AMEV_RPC);
 
@@ -138,34 +157,27 @@ export async function sendMEVProtectedTransaction(
   // Step 2: Build, Sign, and send transaction to Anti-MEV RPC (will be cached, may error - expected)
   console.log('Step 2: Sending transaction to Anti-MEV cache');
   const contractWithSigner = contract.connect(signer);
-  const txData = contractWithSigner.interface.encodeFunctionData(method, params);
 
-  const feeData = await antiMevProvider.getFeeData();
-  const gasLimit = 500000;
-  const gasPrice = feeData.gasPrice || ethers.parseUnits('40', 'gwei');
-
-  // Build the transaction object
-  const tx = {
-    to: contract.target as string,
-    data: txData,
-    value: value ? BigInt(value) : 0n,
-    nonce: nonce,
-    gasLimit: gasLimit,
-    gasPrice: gasPrice,
-    chainId: NEO_X_CHAIN_ID,
-  };
-
-  // Sign the transaction locally
-  const signedTxRaw = await signer.signTransaction(tx);
-  console.log('✓ Transaction signed locally');
-
-  // Send the signed transaction to Anti-MEV RPC directly
+  // We MUST use sendTransaction because MetaMask doesn't support signTransaction
+  // Since we are connected to Anti-MEV RPC, this sends the tx to the cache node
   try {
-    await antiMevProvider.send('eth_sendRawTransaction', [signedTxRaw]);
+    const txData = contractWithSigner.interface.encodeFunctionData(method, params);
+    const feeData = await antiMevProvider.getFeeData();
+    const gasLimit = 500000;
+
+    // Send Transaction (will be broadcast to Anti-MEV node)
+    await signer.sendTransaction({
+      to: contract.target,
+      data: txData,
+      value: value,
+      nonce: nonce,
+      gasLimit: gasLimit,
+      gasPrice: feeData.gasPrice || ethers.parseUnits('40', 'gwei'),
+    });
     console.log('Transaction sent to Anti-MEV RPC (unexpected success)');
   } catch (error: any) {
     // Expected - transaction should be cached but rejected by Anti-MEV RPC
-    console.log('✓ Transaction cached for AntiMEV processing (expected error)');
+    console.log('✓ Transaction cached for AntiMEV processing (expected error or cache confirmation)');
   }
 
   // Step 3: Sign the nonce as a message
@@ -186,34 +198,29 @@ export async function sendMEVProtectedTransaction(
   console.log('Step 5: Encrypting transaction with TPKE');
   const signedTxBytes = ethers.getBytes(signedTx);
   const { encryptedKey, encryptedMsg, roundNumber } = await encryptTransaction(signedTxBytes, NEO_X_AMEV_RPC);
-  console.log('✓ Transaction encrypted', {
-    encryptedKeyLen: encryptedKey.length,
-    encryptedMsgLen: encryptedMsg.length,
-    roundNumber
-  });
+  console.log('✓ Transaction encrypted');
 
   // Step 6: Construct the envelope
   console.log('Step 6: Creating transaction envelope');
   const innerTxHash = ethers.keccak256(signedTx);
   const envelopeData = constructEnvelopeData(
     roundNumber,
-    gasLimit,
+    500000,
     innerTxHash,
     encryptedKey,
     encryptedMsg
   );
-  console.log('✓ Envelope created, size:', envelopeData.length / 2 - 1, 'bytes');
 
   // Step 7: Send the envelope transaction
   console.log('Step 7: Submitting envelope to GovReward contract');
+  // We send Envelope via Anti-MEV RPC (it propagates)
+
   const envelopeTx = {
     to: GOV_REWARD_CONTRACT,
-    from: signerAddress,
     data: envelopeData,
     nonce: nonce, // MUST match inner tx nonce
-    gasLimit: BigInt(gasLimit) + 200000n, // Extra for envelope overhead
-    gasPrice: feeData.gasPrice || ethers.parseUnits('40', 'gwei'),
-    type: 0,
+    gasLimit: 700000n,
+    value: 0n,
   };
 
   const txResponse = await signer.sendTransaction(envelopeTx);
@@ -229,6 +236,7 @@ export async function sendMEVProtectedTransaction(
 
 /**
  * Send a regular (non-MEV-protected) transaction.
+ * Simple wrapper that ensures Standard Network connection.
  */
 export async function sendRegularTransaction(
   contract: ethers.Contract,
@@ -236,24 +244,23 @@ export async function sendRegularTransaction(
   params: any[],
   value?: string
 ): Promise<any> {
-  console.log('=== Sending Regular Transaction ===');
-  console.log('Method:', method, 'Params:', params, 'Value:', value);
+  await ensureNetwork('STANDARD');
 
-  const signer = await contract.runner?.provider?.getSigner();
-  if (!signer) throw new Error('No signer available');
-
+  // Refresh signer after switch
+  const provider = new ethers.BrowserProvider(window.ethereum);
+  const signer = await provider.getSigner();
   const contractWithSigner = contract.connect(signer);
 
   const txOptions: any = {};
-  if (value) {
-    txOptions.value = value;
-  }
+  if (value) txOptions.value = value;
+
+  console.log('Sending regular transaction via wallet...');
+  console.log('Contract address:', contractWithSigner.target);
+  console.log('Params:', params);
 
   const tx = await contractWithSigner[method](...params, txOptions);
   console.log('Transaction sent:', tx.hash);
-
   const receipt = await tx.wait();
-  console.log('Transaction confirmed!');
   return receipt;
 }
 

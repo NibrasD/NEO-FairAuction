@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { Clock, Shield, ShieldOff, User, TrendingUp, Lock, Unlock, Eye, EyeOff } from 'lucide-react';
 import { ethers } from 'ethers';
 import { Auction, supabase } from '../lib/supabase';
-import { getContract, sendMEVProtectedTransaction, createBidCommitment, generateSecret } from '../lib/web3';
+import { getContract, sendMEVProtectedTransaction, sendRegularTransaction, createBidCommitment, generateSecret } from '../lib/web3';
 
 interface AuctionCardProps {
   auction: Auction;
@@ -120,7 +120,7 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
       const contract = getContract(provider);
       const bidAmountWei = ethers.parseEther(bidAmount);
 
-      const receipt = await sendMEVProtectedTransaction(
+      const receipt = await sendRegularTransaction(
         contract,
         'placeBid',
         [auction.blockchain_auction_id],
@@ -217,7 +217,7 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
 
       console.log('Revealing bid:', { amount, secret });
 
-      const receipt = await sendMEVProtectedTransaction(
+      const receipt = await sendRegularTransaction(
         contract,
         'revealBid',
         [auction.blockchain_auction_id, amountWei, secret],
