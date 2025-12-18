@@ -136,8 +136,8 @@ export async function getCachedTransaction(
 ): Promise<string | null> {
   const provider = new ethers.JsonRpcProvider(providerRpcUrl);
 
-  // Convert nonce to hex (as shown in the working example)
-  const nonceHex = ethers.toBeHex(nonce);
+  // Convert nonce to hex (strict format: 0x0 NOT 0x00)
+  const nonceHex = '0x' + nonce.toString(16);
 
   console.log('Fetching cached transaction:', { nonceHex, signature });
 
