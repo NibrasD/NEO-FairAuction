@@ -142,9 +142,21 @@ export async function getCachedTransaction(
   console.log('Fetching cached transaction:', { nonceHex, signature });
 
   try {
-    const cachedTx = await provider.send('eth_getCachedTransaction', [nonceHex, signature]);
-    console.log('Cached transaction retrieved:', cachedTx ? 'success' : 'null');
-    return cachedTx;
+    // Retry loop to handle potential indexing delays
+    for (let i = 0; i < 5; i++) {
+      const cachedTx = await provider.send('eth_getCachedTransaction', [nonceHex, signature]);
+
+      if (cachedTx) {
+        console.log('Cached transaction retrieved:', 'success', 'Attempts:', i + 1);
+        return cachedTx;
+      }
+
+      console.log(`Attempt ${i + 1}: Cached transaction not found yet, retrying...`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+
+    console.warn('Failed to retrieve cached transaction after retries');
+    return null;
   } catch (error) {
     console.error('Error fetching cached transaction:', error);
     return null;
