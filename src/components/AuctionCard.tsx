@@ -37,10 +37,23 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
         try {
           const contract = getContract(provider);
           const blockchainAuction = await contract.getAuction(auction.blockchain_auction_id);
+
           const auctionEndTime = Number(blockchainAuction[6]) * 1000;
           const auctionRevealTime = Number(blockchainAuction[7]) * 1000;
 
-          setRevealTime(new Date(auctionRevealTime));
+          console.log(`Auction ${auction.blockchain_auction_id} chain data:`, {
+            endTime: new Date(auctionEndTime).toISOString(),
+            revealTime: new Date(auctionRevealTime).toISOString(),
+            now: new Date().toISOString()
+          });
+
+          // Sanity check: Ensure timestamps are valid (> 2024)
+          // If contract returns 0, ignore it and fall back to DB time
+          if (auctionRevealTime < 1700000000000) {
+            console.warn('Invalid reveal time from chain, using fallback logic');
+            setPhase(isExpired ? 'ended' : 'active');
+            return;
+          }
 
           const now = Date.now();
           if (now >= auctionRevealTime) {
