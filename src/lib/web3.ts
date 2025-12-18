@@ -61,28 +61,41 @@ export async function connectWallet(): Promise<ethers.BrowserProvider | null> {
           method: 'wallet_switchEthereumChain',
           params: [{ chainId: NEO_X_MAINNET.chainId }],
         });
-        const newProvider = new ethers.BrowserProvider(window.ethereum);
-        return newProvider;
       } catch (switchError: any) {
+        // This error code indicates that the chain has not been added to MetaMask.
         if (switchError.code === 4902) {
           try {
             await window.ethereum.request({
               method: 'wallet_addEthereumChain',
               params: [NEO_X_MAINNET],
             });
-            const newProvider = new ethers.BrowserProvider(window.ethereum);
-            return newProvider;
           } catch (addError) {
             console.error('Error adding network:', addError);
             alert('Failed to add Neo X network. Please add it manually in MetaMask.');
             return null;
           }
+        } else {
+          console.error('Error switching network:', switchError);
+          alert(`Wrong network! Please switch to Neo X Mainnet (${NEO_X_CHAIN_ID}) in MetaMask.`);
+          return null;
         }
-        console.error('Error switching network:', switchError);
-        alert(`Wrong network! Please switch to Neo X Mainnet (${NEO_X_CHAIN_ID}) in MetaMask.`);
-        return null;
+      }
+    } else {
+      // Even if on the right chain, ensure we are using the Standard RPC
+      // This allows switching back from Anti-MEV RPC if previously configured
+      try {
+        await window.ethereum.request({
+          method: 'wallet_addEthereumChain',
+          params: [NEO_X_MAINNET],
+        });
+      } catch (error) {
+        console.log('Network update skipped or rejected', error);
       }
     }
+
+    // specific provider with the new config
+    const newProvider = new ethers.BrowserProvider(window.ethereum);
+    return newProvider;
 
     return provider;
   } catch (error) {
