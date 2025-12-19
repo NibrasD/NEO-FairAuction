@@ -161,8 +161,17 @@ export async function sendMEVProtectedTransaction(
   // Step 1: Get nonce (must use Standard RPC for accuracy)
   console.log('Step 1: Getting transaction nonce from Standard RPC');
   const stdRpcProvider = new ethers.JsonRpcProvider(NEO_X_STANDARD_RPC);
-  const nonce = await stdRpcProvider.getTransactionCount(signerAddress, 'latest');
-  console.log('✓ Nonce (latest):', nonce);
+  const nonce = await stdRpcProvider.getTransactionCount(signerAddress, 'pending');
+  console.log('✓ Nonce (pending):', nonce);
+
+  // Balance Check
+  const balance = await stdRpcProvider.getBalance(signerAddress);
+  console.log('✓ Current Balance:', ethers.formatEther(balance), 'GAS');
+
+  const estimatedCost = ethers.parseUnits('100', 'gwei') * 1000000n; // Conservative estimate
+  if (balance < estimatedCost) {
+    throw new Error(`Insufficient GAS balance. Required: ~${ethers.formatEther(estimatedCost)} GAS, Available: ${ethers.formatEther(balance)} GAS`);
+  }
 
   // Step 2: Build, Sign, and send transaction to Anti-MEV RPC (will be cached)
   console.log('Step 2: Sending transaction to Anti-MEV cache (RPC 5)');
@@ -181,6 +190,7 @@ export async function sendMEVProtectedTransaction(
       nonce: nonce,
       gasLimit: gasLimit,
       gasPrice: feeData.gasPrice || ethers.parseUnits('40', 'gwei'),
+      type: 0 // Explicitly set to Legacy
     });
     console.log('Transaction sent to Anti-MEV RPC (unexpected success)');
   } catch (error: any) {
@@ -233,30 +243,37 @@ export async function sendMEVProtectedTransaction(
   const stdProvider = new ethers.BrowserProvider(window.ethereum);
   const stdSigner = await stdProvider.getSigner();
 
-  const stdFeeData = await stdProvider.getFeeData();
-  const gasPrice = stdFeeData.gasPrice || ethers.parseUnits('40', 'gwei');
-  const gasLimit = 850000n;
+  // Use legacy gas price to avoid EIP-1559 issues (eth_maxPriorityFeePerGas errors)
+  const feeData = await stdProvider.getFeeData();
+  const gasPrice = feeData.gasPrice || ethers.parseUnits('40', 'gwei');
+  const gasLimit = 1000000n; // Increased for extra safety
   const valueWei = value ? BigInt(value) : 0n;
 
   console.log('Submitting envelope to GovReward contract on Standard RPC...');
+  console.log('Final Params:', {
+    to: GOV_REWARD_CONTRACT,
+    gasLimit: gasLimit.toString(),
+    gasPrice: ethers.formatUnits(gasPrice, 'gwei') + ' gwei',
+    value: ethers.formatEther(valueWei) + ' GAS'
+  });
+
   const envelopeTx = {
     to: GOV_REWARD_CONTRACT,
     data: envelopeData,
     nonce: nonce,
     gasLimit: gasLimit,
-    gasPrice: gasPrice,
+    gasPrice: gasPrice, // Force legacy
     value: valueWei,
+    type: 0 // Explicitly set to Legacy
   };
 
   try {
     const txResponse = await stdSigner.sendTransaction(envelopeTx);
     console.log('✓ Envelope submitted to RPC 1:', txResponse.hash);
 
-    // Step 8: Wait for confirmation
-    console.log('Step 8: Waiting for confirmation');
-    const receipt = await txResponse.wait(1);
-    console.log('✅ Anti-MEV transaction confirmed!', receipt?.hash);
-    return receipt;
+    // Return early with the response so UI can update immediately
+    // The wait(1) will happen in the background or be handled by the caller
+    return txResponse;
   } catch (error: any) {
     console.error('Submission Error:', error);
     throw new Error(`Final submission failed: ${error.message}`);
