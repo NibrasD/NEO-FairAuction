@@ -138,10 +138,10 @@ export class TpkePublicKey {
 
     encrypt(msg: Uint8Array): { encryptedKey: Uint8Array; encryptedMsg: Uint8Array } {
         // 1. Generate random scalars r1, r2
-        const r1Bytes = bls12_381.utils.randomPrivateKey();
+        const r1Bytes = bls12_381.utils.randomSecretKey();
         const r1 = bytesToBigInt(r1Bytes);
 
-        const r2Bytes = bls12_381.utils.randomPrivateKey();
+        const r2Bytes = bls12_381.utils.randomSecretKey();
         const r2 = bytesToBigInt(r2Bytes);
 
         // 2. Compute ephemeral points
