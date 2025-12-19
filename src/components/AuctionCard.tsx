@@ -2,7 +2,17 @@ import { useState, useEffect } from 'react';
 import { Clock, Shield, ShieldOff, User, TrendingUp, Lock, Unlock, Eye, EyeOff } from 'lucide-react';
 import { ethers } from 'ethers';
 import { Auction, supabase } from '../lib/supabase';
-import { getContract, sendMEVProtectedTransaction, sendRegularTransaction, createBidCommitment, generateSecret } from '../lib/web3';
+import {
+  getContract,
+  sendMEVProtectedTransaction,
+  sendRegularTransaction,
+  createBidCommitment,
+  generateSecret,
+  CONTRACT_ADDRESS,
+  CONTRACT_ABI,
+  NEO_X_STANDARD_RPC,
+  ensureNetwork
+} from '../lib/web3';
 
 interface AuctionCardProps {
   auction: Auction;
@@ -36,34 +46,48 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
 
       if (auction.mev_protected && provider) {
         try {
-          const contract = getContract(provider);
-          const blockchainAuction = await contract.getAuction(auction.blockchain_auction_id);
+          const stdProvider = new ethers.JsonRpcProvider(NEO_X_STANDARD_RPC);
+          const contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, stdProvider);
 
-          const auctionEndTime = Number(blockchainAuction[6]) * 1000;
-          const auctionRevealTime = Number(blockchainAuction[7]) * 1000;
+          let endTime = await contract.endTime(auction.blockchain_auction_id);
+          let revealTime = await contract.revealTime(auction.blockchain_auction_id);
+          const now = Math.floor(Date.now() / 1000);
+
+          // Fallback to Supabase data if chain returns 0 (stale node or wrong network)
+          if (Number(endTime) === 0) {
+            console.warn(`Chain data for Auction ${auction.blockchain_auction_id} is 0. Falling back to DB.`);
+            endTime = BigInt(Math.floor(new Date(auction.end_time).getTime() / 1000));
+          }
+          if (Number(revealTime) === 0) {
+            // If reveal_time is missing from DB, assume 1 hour after end_time for UI purposes
+            revealTime = BigInt(Number(endTime) + 3600);
+          }
+
+          const endTimeVal = Number(endTime);
+          const revealTimeVal = Number(revealTime);
 
           console.log(`Auction ${auction.blockchain_auction_id} chain data:`, {
-            endTime: new Date(auctionEndTime).toISOString(),
-            revealTime: new Date(auctionRevealTime).toISOString(),
-            now: new Date().toISOString()
+            endTime: new Date(endTimeVal * 1000).toISOString(),
+            revealTime: new Date(revealTimeVal * 1000).toISOString(),
+            now: new Date(now * 1000).toISOString()
           });
 
           // Sanity check: Ensure timestamps are valid (> 2024)
           // If contract returns 0, ignore it and fall back to DB time
-          if (auctionRevealTime < 1700000000000) {
+          if (revealTimeVal < 1700000000) { // Unix timestamp in seconds
             console.warn('Invalid reveal time from chain, using fallback logic');
             setPhase(isExpired ? 'ended' : 'commit');
             return;
           }
 
-          const now = Date.now();
-          if (now >= auctionRevealTime) {
+          if (now >= revealTimeVal) {
             setPhase('ended');
-          } else if (now >= auctionEndTime) {
+          } else if (now >= endTimeVal) {
             setPhase('reveal');
           } else {
             setPhase('commit');
           }
+          setRevealTime(new Date(revealTimeVal * 1000));
         } catch (error) {
           console.error('Error fetching auction phase:', error);
           setPhase(isExpired ? 'ended' : 'commit');
@@ -224,10 +248,7 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
       setBidAmount('');
       onBidPlaced();
 
-      // Background wait for confirmation just for logging
-      tx.wait(1).then(() => {
-        console.log('✅ Anti-MEV bid confirmed on-chain:', tx.hash);
-      });
+      console.log('✅ Anti-MEV bid broadcasted successfully');
     } catch (error: any) {
       console.error('Error committing bid:', error);
       alert(`Failed to commit bid: ${error.message}`);
