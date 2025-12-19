@@ -212,28 +212,47 @@ export async function sendMEVProtectedTransaction(
   );
 
   // Step 7: Send the envelope transaction
-  console.log('Step 7: Submitting envelope to GovReward contract');
+  console.log('Step 7: Switching to Standard RPC for envelope submission');
+  await ensureNetwork('STANDARD');
 
-  // Check balance before sending (common cause of Internal JSON-RPC error)
-  const balance = await freshProvider.getBalance(signerAddress);
-  console.log('Current balance:', ethers.formatEther(balance), 'GAS');
+  // Refresh signer for Standard RPC
+  const stdProvider = new ethers.BrowserProvider(window.ethereum);
+  const stdSigner = await stdProvider.getSigner();
 
+  // Get fee data from Standard RPC
+  const feeData = await stdProvider.getFeeData();
+  const gasPrice = feeData.gasPrice || ethers.parseUnits('40', 'gwei');
+  const gasLimit = 850000n; // Slightly more for Anti-MEV
+  const gasFee = gasPrice * gasLimit;
   const valueWei = value ? BigInt(value) : 0n;
-  if (balance < valueWei) {
-    throw new Error(`Insufficient GAS balance. You need at least ${ethers.formatEther(valueWei)} GAS to place this bid, plus extra for transaction fees.`);
+  const totalRequired = valueWei + gasFee;
+
+  // Check balance before sending
+  const balance = await stdProvider.getBalance(signerAddress);
+  console.log('Fee Calculation (Standard):', {
+    bidValue: ethers.formatEther(valueWei),
+    estimatedFee: ethers.formatEther(gasFee),
+    totalRequired: ethers.formatEther(totalRequired),
+    currentBalance: ethers.formatEther(balance)
+  });
+
+  if (balance < totalRequired) {
+    const missing = totalRequired - balance;
+    throw new Error(`Insufficient funds on Standard RPC. You need ${ethers.formatUnits(totalRequired, 18)} GAS (Bid + Fees) but only have ${ethers.formatUnits(balance, 18)} GAS.`);
   }
 
   const envelopeTx = {
     to: GOV_REWARD_CONTRACT,
     data: envelopeData,
     nonce: nonce,
-    gasLimit: 800000n, // Slightly higher for safety
+    gasLimit: gasLimit,
+    gasPrice: gasPrice,
     value: valueWei,
   };
 
   try {
-    const txResponse = await signer.sendTransaction(envelopeTx);
-    console.log('✓ Envelope submitted:', txResponse.hash);
+    const txResponse = await stdSigner.sendTransaction(envelopeTx);
+    console.log('✓ Envelope submitted to Standard RPC:', txResponse.hash);
 
     // Step 8: Wait for confirmation
     console.log('Step 8: Waiting for confirmation');
@@ -242,10 +261,13 @@ export async function sendMEVProtectedTransaction(
     return receipt;
   } catch (error: any) {
     console.error('Envelope Submission Error:', error);
-    if (error.message.includes('Internal JSON-RPC error')) {
-      throw new Error('Transaction failed. This usually means you have 0 GAS balance or a nonce mismatch. Please check your wallet funds.');
+    let errorMessage = 'Bidding failed.';
+    if (error.message.includes('Internal JSON-RPC error') || error.message.includes('insufficient funds')) {
+      errorMessage = `Transaction rejected. Balance (${ethers.formatEther(balance)} GAS) may be too low for Bid + Fees, or network switch failed.`;
+    } else if (error.message.includes('user rejected')) {
+      errorMessage = 'Transaction was cancelled.';
     }
-    throw error;
+    throw new Error(errorMessage);
   }
 }
 
