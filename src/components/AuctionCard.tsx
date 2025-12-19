@@ -180,6 +180,16 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
         bidAmountWei.toString()
       );
 
+      // Record in Supabase as hidden bid
+      await supabase.from('bids').insert({
+        auction_id: auction.id,
+        blockchain_auction_id: auction.blockchain_auction_id,
+        bidder_address: userAddress,
+        bid_amount: '0', // Hidden
+        transaction_hash: receipt.hash,
+        mev_protected: true,
+      });
+
       setCommittedSecret(secret);
       setCommittedAmount(bidAmount);
       localStorage.setItem(`bid_secret_${auction.blockchain_auction_id}_${userAddress}`, secret);
