@@ -60,30 +60,66 @@ export class TpkePublicKey {
     ): TpkePublicKey {
         console.log('--- fromAggregatedCommitment ---');
         console.log('Commitment length:', commitment.length);
-        console.log('Commitment hex:', bytesToHex(commitment).slice(0, 80));
+        console.log('Commitment hex (start):', bytesToHex(commitment).slice(0, 64));
 
-        // Try extracting as compressed G1 (48 bytes)
-        if (commitment.length >= 48) {
+        // Format 1: 128 bytes (Two 64-byte words, each with 16-byte zero padding + 48-byte coordinate)
+        // This is the uncompressed (X, Y) format often seen in Neo X EVM results
+        if (commitment.length === 128) {
             try {
-                const g1Bytes = commitment.slice(0, 48);
-                const hexString = bytesToHex(g1Bytes);
-                console.log('Attempting G1.fromHex with 48 bytes...');
+                console.log('Detected 128-byte format (likely uncompressed G1 with padding)');
+                // Segment 1 (X): skip 16 bytes, take 48
+                const x = commitment.slice(16, 64);
+                // Segment 2 (Y): skip 16 bytes (at 64), take 48
+                const y = commitment.slice(80, 128);
+
+                // Concatenate into 96-byte uncompressed format
+                const uncompressed = new Uint8Array(96);
+                uncompressed.set(x, 0);
+                uncompressed.set(y, 48);
+
+                const hexString = bytesToHex(uncompressed);
+                console.log('Attempting G1.fromHex with 96-byte uncompressed data...');
+                const point = G1.fromHex(hexString);
+                console.log('✓ Success: G1.fromHex (uncompressed)');
+                return new TpkePublicKey(point);
+            } catch (e: any) {
+                console.log('Failed uncompressed G1 parsing:', e.message);
+            }
+        }
+
+        // Format 2: 96 bytes (Uncompressed G1 point without extra padding)
+        if (commitment.length === 96) {
+            try {
+                const hexString = bytesToHex(commitment);
+                console.log('Attempting G1.fromHex with 96-byte data...');
                 const point = G1.fromHex(hexString);
                 console.log('✓ Success: G1.fromHex');
                 return new TpkePublicKey(point);
             } catch (e: any) {
-                console.log('Failed G1 parsing (0-48):', e.message);
+                console.log('Failed 96-byte G1 parsing:', e.message);
             }
         }
 
-        // Alternative: Skip first 32 bytes (padding), take next 48
+        // Format 3: 48 bytes (Compressed G1 point)
+        if (commitment.length === 48) {
+            try {
+                const hexString = bytesToHex(commitment);
+                console.log('Attempting G1.fromHex with 48-byte compressed data...');
+                const point = G1.fromHex(hexString);
+                console.log('✓ Success: G1.fromHex');
+                return new TpkePublicKey(point);
+            } catch (e: any) {
+                console.log('Failed 48-byte G1 parsing:', e.message);
+            }
+        }
+
+        // Alternative: Specific offset parsing if needed (legacy or specialized)
         if (commitment.length >= 80) {
             try {
                 const g1Bytes = commitment.slice(32, 80);
                 const hexString = bytesToHex(g1Bytes);
-                console.log('Attempting G1.fromHex with bytes 32-80...');
+                console.log('Attempting alternate G1.fromHex (offset 32-80)...');
                 const point = G1.fromHex(hexString);
-                console.log('✓ Success: G1.fromHex (32-80)');
                 return new TpkePublicKey(point);
             } catch (e: any) {
                 console.log('Failed alternate G1 parsing (32-80):', e.message);
@@ -96,7 +132,7 @@ export class TpkePublicKey {
             return new TpkePublicKey(point);
         } catch (e: any) {
             console.error('Final fallback failed:', e.message);
-            throw new Error(`Invalid TPKE public key format. Expected 48 or 96 bytes, got ${commitment.length}. Error: ${e.message}`);
+            throw new Error(`Invalid TPKE public key format. Got ${commitment.length} bytes. Check the console for more details.`);
         }
     }
 
