@@ -1,315 +1,470 @@
+import { useState, useEffect } from 'react';
+import { Clock, Shield, ShieldOff, User, TrendingUp, Lock, Unlock, Eye, EyeOff } from 'lucide-react';
 import { ethers } from 'ethers';
-import {
-  encryptTransaction,
-  constructEnvelopeData,
-  getCachedTransaction,
-  NEO_X_AMEV_RPC,
-  GOV_REWARD_CONTRACT
-} from './antiMev';
+import { Auction, supabase } from '../lib/supabase';
+import { getContract, sendMEVProtectedTransaction, sendRegularTransaction, createBidCommitment, generateSecret } from '../lib/web3';
 
-export const NEO_X_STANDARD_RPC = 'https://mainnet-1.rpc.banelabs.org';
-export const NEO_X_CHAIN_ID = 47763;
+interface AuctionCardProps {
+  auction: Auction;
+  provider: ethers.BrowserProvider | null;
+  userAddress: string | null;
+  onBidPlaced: () => void;
+}
 
-export const NEO_X_MAINNET = {
-  chainId: '0xba93',
-  chainName: 'Neo X Mainnet',
-  nativeCurrency: {
-    name: 'GAS',
-    symbol: 'GAS',
-    decimals: 18,
-  },
-  rpcUrls: [NEO_X_STANDARD_RPC],
-  blockExplorerUrls: ['https://xexplorer.neo.org'],
-};
+type AuctionPhase = 'commit' | 'reveal' | 'ended' | 'active';
 
-export const CONTRACT_ADDRESS = '0x3256e67769bac151A2b23F15115ADB04462ea797';
+export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: AuctionCardProps) {
+  const [bidAmount, setBidAmount] = useState('');
+  const [isBidding, setIsBidding] = useState(false);
+  const [committedSecret, setCommittedSecret] = useState<string | null>(null);
+  const [committedAmount, setCommittedAmount] = useState<string | null>(null);
+  const [phase, setPhase] = useState<AuctionPhase>('active');
+  const [revealTime, setRevealTime] = useState<Date | null>(null);
 
-export const CONTRACT_ABI = [
-  'function createAuction(string memory _itemName, string memory _description, uint256 _startingBid, uint256 _duration, bool _mevProtected) external returns (uint256)',
-  'function placeBid(uint256 _auctionId) external payable',
-  'function commitBid(uint256 _auctionId, bytes32 _commitment) external payable',
-  'function revealBid(uint256 _auctionId, uint256 _amount, string memory _secret) external',
-  'function endAuction(uint256 _auctionId) external',
-  'function getAuction(uint256 _auctionId) external view returns (address seller, string memory itemName, string memory description, uint256 startingBid, uint256 highestBid, address highestBidder, uint256 endTime, uint256 revealTime, bool ended, bool mevProtected)',
-  'function getCommitment(uint256 _auctionId, address _bidder) external view returns (bytes32 commitment, uint256 deposit, bool revealed)',
-  'function withdraw(uint256 _auctionId) external',
-  'function auctionCount() external view returns (uint256)',
-  'event AuctionCreated(uint256 indexed auctionId, address indexed seller, string itemName, uint256 startingBid, uint256 endTime, uint256 revealTime, bool mevProtected)',
-  'event BidPlaced(uint256 indexed auctionId, address indexed bidder, uint256 amount, bool mevProtected)',
-  'event BidCommitted(uint256 indexed auctionId, address indexed bidder, bytes32 commitment)',
-  'event BidRevealed(uint256 indexed auctionId, address indexed bidder, uint256 amount)',
-  'event AuctionEnded(uint256 indexed auctionId, address winner, uint256 amount)',
-];
+  const endTime = new Date(auction.end_time);
+  const now = new Date();
+  const timeRemaining = endTime.getTime() - now.getTime();
+  const isExpired = timeRemaining <= 0 || auction.ended;
 
-export async function connectWallet(): Promise<ethers.BrowserProvider | null> {
-  if (typeof window.ethereum === 'undefined') {
-    alert('Please install MetaMask to use this dApp');
-    return null;
-  }
+  useEffect(() => {
+    const updatePhase = async () => {
+      if (auction.ended) {
+        setPhase('ended');
+        return;
+      }
 
-  try {
-    await window.ethereum.request({ method: 'eth_requestAccounts' });
-    const provider = new ethers.BrowserProvider(window.ethereum);
+      if (auction.mev_protected && provider) {
+        try {
+          const contract = getContract(provider);
+          const blockchainAuction = await contract.getAuction(auction.blockchain_auction_id);
 
-    const network = await provider.getNetwork();
-    console.log('Connected to network:', network.chainId.toString());
+          const auctionEndTime = Number(blockchainAuction[6]) * 1000;
+          const auctionRevealTime = Number(blockchainAuction[7]) * 1000;
 
-    const validChainIds = [BigInt(NEO_X_CHAIN_ID), BigInt(12227332)];
+          console.log(`Auction ${auction.blockchain_auction_id} chain data:`, {
+            endTime: new Date(auctionEndTime).toISOString(),
+            revealTime: new Date(auctionRevealTime).toISOString(),
+            now: new Date().toISOString()
+          });
 
-    if (!validChainIds.includes(network.chainId)) {
-      try {
-        await window.ethereum.request({
-          method: 'wallet_switchEthereumChain',
-          params: [{ chainId: NEO_X_MAINNET.chainId }],
-        });
-      } catch (switchError: any) {
-        if (switchError.code === 4902) {
-          try {
-            await window.ethereum.request({
-              method: 'wallet_addEthereumChain',
-              params: [NEO_X_MAINNET],
-            });
-          } catch (addError) {
-            console.error('Error adding network:', addError);
-            alert('Failed to add Neo X network. Please add it manually in MetaMask.');
-            return null;
+          // Sanity check: Ensure timestamps are valid (> 2024)
+          // If contract returns 0, ignore it and fall back to DB time
+          if (auctionRevealTime < 1700000000000) {
+            console.warn('Invalid reveal time from chain, using fallback logic');
+            setPhase(isExpired ? 'ended' : 'commit');
+            return;
           }
-        } else {
-          console.error('Error switching network:', switchError);
-          alert(`Wrong network! Please switch to Neo X Mainnet (${NEO_X_CHAIN_ID}) in MetaMask.`);
-          return null;
+
+          const now = Date.now();
+          if (now >= auctionRevealTime) {
+            setPhase('ended');
+          } else if (now >= auctionEndTime) {
+            setPhase('reveal');
+          } else {
+            setPhase('commit');
+          }
+        } catch (error) {
+          console.error('Error fetching auction phase:', error);
+          setPhase(isExpired ? 'ended' : 'commit');
         }
+      } else {
+        setPhase(isExpired ? 'ended' : 'active');
       }
+    };
+
+    updatePhase();
+    const interval = setInterval(updatePhase, 5000);
+    return () => clearInterval(interval);
+  }, [auction, provider, isExpired]);
+
+  const formatTime = (ms: number) => {
+    if (ms <= 0) return 'Ended';
+    const hours = Math.floor(ms / (1000 * 60 * 60));
+    const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
+    const seconds = Math.floor((ms % (1000 * 60)) / 1000);
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    if (minutes > 0) return `${minutes}m ${seconds}s`;
+    return `${seconds}s`;
+  };
+
+  const formatGAS = (wei: string) => {
+    try {
+      return parseFloat(ethers.formatEther(wei)).toFixed(4);
+    } catch {
+      return '0.0000';
+    }
+  };
+
+  const handleNormalBid = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!provider || !userAddress) {
+      alert('Please connect your wallet first');
+      return;
+    }
+
+    if (!bidAmount || parseFloat(bidAmount) <= 0) {
+      alert('Please enter a valid bid amount');
+      return;
+    }
+
+    const bidAmountFloat = parseFloat(bidAmount);
+    const currentBidFloat = parseFloat(formatGAS(auction.highest_bid !== '0' ? auction.highest_bid : auction.starting_bid));
+
+    if (bidAmountFloat <= currentBidFloat) {
+      alert(`Bid must be higher than current bid of ${currentBidFloat} GAS`);
+      return;
+    }
+
+    setIsBidding(true);
+    try {
+      const contract = getContract(provider);
+      const bidAmountWei = ethers.parseEther(bidAmount);
+
+      const receipt = await sendRegularTransaction(
+        contract,
+        'placeBid',
+        [auction.blockchain_auction_id],
+        bidAmountWei.toString()
+      );
+
+      await supabase.from('auctions').update({
+        highest_bid: bidAmountWei.toString(),
+        highest_bidder: userAddress,
+      }).eq('blockchain_auction_id', auction.blockchain_auction_id);
+
+      await supabase.from('bids').insert({
+        auction_id: auction.id,
+        blockchain_auction_id: auction.blockchain_auction_id,
+        bidder_address: userAddress,
+        bid_amount: bidAmountWei.toString(),
+        transaction_hash: receipt.hash,
+        mev_protected: false,
+      });
+
+      setBidAmount('');
+      onBidPlaced();
+      alert('Bid placed successfully! Your bid is now visible to everyone.');
+    } catch (error: any) {
+      console.error('Error placing bid:', error);
+      alert(`Failed to place bid: ${error.message}`);
+    } finally {
+      setIsBidding(false);
+    }
+  };
+
+  const handleCommitBid = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!provider || !userAddress) {
+      alert('Please connect your wallet first');
+      return;
+    }
+
+    if (!bidAmount || parseFloat(bidAmount) <= 0) {
+      alert('Please enter a valid bid amount');
+      return;
+    }
+
+    setIsBidding(true);
+    try {
+      const contract = getContract(provider);
+      const secret = generateSecret();
+      const commitment = createBidCommitment(bidAmount, secret, userAddress);
+      const bidAmountWei = ethers.parseEther(bidAmount);
+
+      console.log('Creating commitment:', { bidAmount, secret, commitment });
+
+      const receipt = await sendMEVProtectedTransaction(
+        contract,
+        'commitBid',
+        [auction.blockchain_auction_id, commitment],
+        bidAmountWei.toString()
+      );
+
+      // Record in Supabase as hidden bid
+      await supabase.from('bids').insert({
+        auction_id: auction.id,
+        blockchain_auction_id: auction.blockchain_auction_id,
+        bidder_address: userAddress,
+        bid_amount: '0', // Hidden
+        transaction_hash: receipt.hash,
+        mev_protected: true,
+      });
+
+      setCommittedSecret(secret);
+      setCommittedAmount(bidAmount);
+      localStorage.setItem(`bid_secret_${auction.blockchain_auction_id}_${userAddress}`, secret);
+      localStorage.setItem(`bid_amount_${auction.blockchain_auction_id}_${userAddress}`, bidAmount);
+
+      alert('Bid committed successfully! Your bid is hidden until the reveal phase. Keep this window open or save your bid details.');
+      setBidAmount('');
+      onBidPlaced();
+    } catch (error: any) {
+      console.error('Error committing bid:', error);
+      alert(`Failed to commit bid: ${error.message}`);
+    } finally {
+      setIsBidding(false);
+    }
+  };
+
+  const handleRevealBid = async () => {
+    if (!provider || !userAddress) {
+      alert('Please connect your wallet first');
+      return;
+    }
+
+    const secret = committedSecret || localStorage.getItem(`bid_secret_${auction.blockchain_auction_id}_${userAddress}`);
+    const amount = committedAmount || localStorage.getItem(`bid_amount_${auction.blockchain_auction_id}_${userAddress}`);
+
+    if (!secret || !amount) {
+      alert('No committed bid found. You must commit a bid during the commit phase first.');
+      return;
+    }
+
+    setIsBidding(true);
+    try {
+      const contract = getContract(provider);
+      const amountWei = ethers.parseEther(amount);
+
+      console.log('Revealing bid:', { amount, secret });
+
+      const receipt = await sendRegularTransaction(
+        contract,
+        'revealBid',
+        [auction.blockchain_auction_id, amountWei, secret],
+        undefined
+      );
+
+      await supabase.from('bids').insert({
+        auction_id: auction.id,
+        blockchain_auction_id: auction.blockchain_auction_id,
+        bidder_address: userAddress,
+        bid_amount: amountWei.toString(),
+        transaction_hash: receipt.hash,
+        mev_protected: true,
+      });
+
+      localStorage.removeItem(`bid_secret_${auction.blockchain_auction_id}_${userAddress}`);
+      localStorage.removeItem(`bid_amount_${auction.blockchain_auction_id}_${userAddress}`);
+      setCommittedSecret(null);
+      setCommittedAmount(null);
+
+      alert('Bid revealed successfully!');
+      onBidPlaced();
+    } catch (error: any) {
+      console.error('Error revealing bid:', error);
+      alert(`Failed to reveal bid: ${error.message}`);
+    } finally {
+      setIsBidding(false);
+    }
+  };
+
+  useEffect(() => {
+    if (userAddress && auction.mev_protected) {
+      const secret = localStorage.getItem(`bid_secret_${auction.blockchain_auction_id}_${userAddress}`);
+      const amount = localStorage.getItem(`bid_amount_${auction.blockchain_auction_id}_${userAddress}`);
+      if (secret && amount) {
+        setCommittedSecret(secret);
+        setCommittedAmount(amount);
+      }
+    }
+  }, [auction.blockchain_auction_id, userAddress, auction.mev_protected]);
+
+  const getPhaseInfo = () => {
+    if (phase === 'commit') {
+      return {
+        title: 'Commit Phase',
+        subtitle: 'Submit your hidden bid',
+        icon: <Lock className="h-4 w-4" />,
+        color: 'text-blue-400',
+        bgColor: 'bg-blue-500/10'
+      };
+    } else if (phase === 'reveal') {
+      const revealTimeRemaining = revealTime ? revealTime.getTime() - Date.now() : 0;
+      return {
+        title: 'Reveal Phase',
+        subtitle: `${formatTime(revealTimeRemaining)} left to reveal`,
+        icon: <Unlock className="h-4 w-4" />,
+        color: 'text-amber-400',
+        bgColor: 'bg-amber-500/10'
+      };
+    } else if (phase === 'ended') {
+      return {
+        title: 'Ended',
+        subtitle: auction.highest_bidder ? 'Auction completed' : 'No bids',
+        icon: <Clock className="h-4 w-4" />,
+        color: 'text-slate-400',
+        bgColor: 'bg-slate-900'
+      };
     } else {
-      // Even if on the right chain, ensure we are using the Standard RPC
-      try {
-        await window.ethereum.request({
-          method: 'wallet_addEthereumChain',
-          params: [NEO_X_MAINNET],
-        });
-      } catch (error) {
-        console.log('Network update skipped or rejected', error);
-      }
+      return {
+        title: 'Active',
+        subtitle: 'Bidding open',
+        icon: <TrendingUp className="h-4 w-4" />,
+        color: 'text-emerald-400',
+        bgColor: 'bg-emerald-500/10'
+      };
     }
-
-    const newProvider = new ethers.BrowserProvider(window.ethereum);
-    return newProvider;
-  } catch (error) {
-    console.error('Error connecting wallet:', error);
-    alert('Error connecting wallet. Please try again.');
-    return null;
-  }
-}
-
-export function getContract(provider: ethers.BrowserProvider) {
-  return new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
-}
-
-/**
- * Switch wallet to the specified network RPC
- */
-export async function ensureNetwork(type: 'STANDARD' | 'ANTIMEV'): Promise<void> {
-  const targetRPC = type === 'STANDARD' ? NEO_X_STANDARD_RPC : NEO_X_AMEV_RPC;
-  const chainConfig = {
-    ...NEO_X_MAINNET,
-    rpcUrls: [targetRPC],
   };
 
-  try {
-    // Force add/switch to update RPC URL even if chainId is the same
-    await window.ethereum.request({
-      method: 'wallet_addEthereumChain',
-      params: [chainConfig],
-    });
-  } catch (error) {
-    console.error(`Failed to switch to ${type} RPC:`, error);
-    throw new Error(`Please switch your wallet network to use ${type === 'STANDARD' ? 'Standard' : 'Anti-MEV'} RPC.`);
-  }
-}
+  const phaseInfo = getPhaseInfo();
+  const isOwner = userAddress && userAddress.toLowerCase() === auction.seller_address.toLowerCase();
 
-/**
- * Main function to send an Anti-MEV protected transaction.
- * Follows the correct Neo X envelope flow based on official examples.
- */
-export async function sendMEVProtectedTransaction(
-  contract: ethers.Contract,
-  method: string,
-  params: any[],
-  value?: string,
-  provider?: ethers.BrowserProvider
-): Promise<any> {
-  console.log('=== Neo X Anti-MEV Envelope Flow ===');
+  return (
+    <div className="bg-slate-800 rounded-lg p-6 border border-slate-700 hover:border-slate-600 transition-colors">
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex-1">
+          <h3 className="text-lg font-bold text-white mb-1">{auction.item_name}</h3>
+          <p className="text-sm text-slate-400 line-clamp-2">{auction.description}</p>
+        </div>
+        <div className="ml-4 flex flex-col space-y-2">
+          {auction.mev_protected ? (
+            <div className="flex items-center space-x-1 px-2 py-1 bg-emerald-500/10 rounded-full">
+              <Shield className="h-4 w-4 text-emerald-400" />
+              <span className="text-xs text-emerald-400 font-medium">MEV Protected</span>
+            </div>
+          ) : (
+            <div className="flex items-center space-x-1 px-2 py-1 bg-orange-500/10 rounded-full">
+              <ShieldOff className="h-4 w-4 text-orange-400" />
+              <span className="text-xs text-orange-400 font-medium">Standard</span>
+            </div>
+          )}
+          {auction.mev_protected && (
+            <div className={`flex items-center space-x-1 px-2 py-1 ${phaseInfo.bgColor} rounded-full`}>
+              {phaseInfo.icon}
+              <span className={`text-xs ${phaseInfo.color} font-medium`}>{phaseInfo.title}</span>
+            </div>
+          )}
+        </div>
+      </div>
 
-  // Enforce Anti-MEV Network Connection
-  await ensureNetwork('ANTIMEV');
+      <div className="grid grid-cols-2 gap-4 mb-4">
+        <div className="bg-slate-900 rounded-lg p-3">
+          <div className="flex items-center space-x-2 mb-1">
+            {auction.mev_protected && phase === 'commit' ? (
+              <EyeOff className="h-4 w-4 text-slate-400" />
+            ) : (
+              <Eye className="h-4 w-4 text-slate-400" />
+            )}
+            <span className="text-xs text-slate-400">
+              {auction.mev_protected && phase === 'commit' ? 'Starting Bid' : 'Current Bid'}
+            </span>
+          </div>
+          <p className="text-lg font-bold text-white">
+            {auction.mev_protected && phase === 'commit'
+              ? formatGAS(auction.starting_bid)
+              : (auction.highest_bid !== '0' ? formatGAS(auction.highest_bid) : formatGAS(auction.starting_bid))
+            } GAS
+          </p>
+          {auction.mev_protected && phase === 'commit' && (
+            <p className="text-xs text-slate-500 mt-1">Bids hidden</p>
+          )}
+        </div>
 
-  // Re-initialize provider/signer after network switch
-  const freshProvider = new ethers.BrowserProvider(window.ethereum);
-  const signer = await freshProvider.getSigner();
-  const signerAddress = await signer.getAddress();
-  const antiMevProvider = new ethers.JsonRpcProvider(NEO_X_AMEV_RPC);
+        <div className="bg-slate-900 rounded-lg p-3">
+          <div className="flex items-center space-x-2 mb-1">
+            <Clock className="h-4 w-4 text-slate-400" />
+            <span className="text-xs text-slate-400">
+              {auction.mev_protected && phase === 'commit' ? 'Commit Time' : 'Time Left'}
+            </span>
+          </div>
+          <p className={`text-lg font-bold ${phase === 'ended' ? 'text-slate-500' : 'text-white'}`}>
+            {formatTime(timeRemaining)}
+          </p>
+        </div>
+      </div>
 
-  // Step 1: Get nonce from Anti-MEV RPC
-  console.log('Step 1: Getting transaction nonce');
-  const nonce = await antiMevProvider.getTransactionCount(signerAddress, 'pending');
-  console.log('✓ Nonce:', nonce);
+      {auction.highest_bidder && phase !== 'commit' && (
+        <div className="flex items-center space-x-2 mb-4 px-3 py-2 bg-slate-900 rounded-lg">
+          <User className="h-4 w-4 text-slate-400" />
+          <span className="text-xs text-slate-400">Leading:</span>
+          <span className="text-xs text-white font-mono">
+            {auction.highest_bidder.slice(0, 6)}...{auction.highest_bidder.slice(-4)}
+          </span>
+        </div>
+      )}
 
-  // Step 2: Build, Sign, and send transaction to Anti-MEV RPC (will be cached, may error - expected)
-  console.log('Step 2: Sending transaction to Anti-MEV cache');
-  const contractWithSigner = contract.connect(signer);
+      {committedAmount && committedSecret && phase === 'commit' && (
+        <div className="mb-4 px-3 py-2 bg-blue-500/10 rounded-lg border border-blue-500/20">
+          <div className="flex items-center space-x-2 mb-1">
+            <Lock className="h-4 w-4 text-blue-400" />
+            <span className="text-xs text-blue-400 font-medium">Your Committed Bid</span>
+          </div>
+          <p className="text-sm text-white font-mono">{committedAmount} GAS (Hidden)</p>
+          <p className="text-xs text-slate-400 mt-1">Will be revealed in reveal phase</p>
+        </div>
+      )}
 
-  // We MUST use sendTransaction because MetaMask doesn't support signTransaction
-  // Since we are connected to Anti-MEV RPC, this sends the tx to the cache node
-  try {
-    const txData = contractWithSigner.interface.encodeFunctionData(method, params);
-    const feeData = await antiMevProvider.getFeeData();
-    const gasLimit = 500000;
+      {!isOwner && userAddress && auction.mev_protected && phase === 'commit' && !committedSecret && (
+        <form onSubmit={handleCommitBid} className="space-y-2">
+          <input
+            type="number"
+            step="0.001"
+            min={formatGAS(auction.starting_bid)}
+            value={bidAmount}
+            onChange={(e) => setBidAmount(e.target.value)}
+            placeholder="Enter bid amount (will be hidden)"
+            className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <button
+            type="submit"
+            disabled={isBidding}
+            className="w-full px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-sm flex items-center justify-center space-x-2"
+          >
+            <Lock className="h-4 w-4" />
+            <span>{isBidding ? 'Committing...' : 'Commit Bid (Hidden)'}</span>
+          </button>
+        </form>
+      )}
 
-    // Send Transaction (will be broadcast to Anti-MEV node)
-    await signer.sendTransaction({
-      to: contract.target,
-      data: txData,
-      value: value,
-      nonce: nonce,
-      gasLimit: gasLimit,
-      gasPrice: feeData.gasPrice || ethers.parseUnits('40', 'gwei'),
-    });
-    console.log('Transaction sent to Anti-MEV RPC (unexpected success)');
-  } catch (error: any) {
-    // Expected - transaction should be cached but rejected by Anti-MEV RPC
-    console.log('✓ Transaction cached for AntiMEV processing (expected error or cache confirmation)');
-  }
+      {!isOwner && userAddress && auction.mev_protected && phase === 'reveal' && committedSecret && (
+        <button
+          onClick={handleRevealBid}
+          disabled={isBidding}
+          className="w-full px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-sm flex items-center justify-center space-x-2"
+        >
+          <Unlock className="h-4 w-4" />
+          <span>{isBidding ? 'Revealing...' : `Reveal Your Bid (${committedAmount} GAS)`}</span>
+        </button>
+      )}
 
-  // Step 3: Sign the nonce as a message
-  console.log('Step 3: Signing nonce message');
-  const signature = await signer.signMessage(nonce.toString());
-  console.log('✓ Signature obtained');
+      {!isOwner && userAddress && !auction.mev_protected && phase === 'active' && (
+        <form onSubmit={handleNormalBid} className="flex space-x-2">
+          <input
+            type="number"
+            step="0.001"
+            min={formatGAS(auction.highest_bid !== '0' ? auction.highest_bid : auction.starting_bid)}
+            value={bidAmount}
+            onChange={(e) => setBidAmount(e.target.value)}
+            placeholder="Enter bid amount (visible)"
+            className="flex-1 px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-white text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+          />
+          <button
+            type="submit"
+            disabled={isBidding}
+            className="px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-sm"
+          >
+            {isBidding ? 'Bidding...' : 'Place Bid'}
+          </button>
+        </form>
+      )}
 
-  // Step 4: Fetch the cached signed transaction
-  console.log('Step 4: Retrieving cached transaction');
-  const signedTx = await getCachedTransaction(nonce, signature, NEO_X_AMEV_RPC);
+      {!userAddress && phase !== 'ended' && (
+        <div className="text-center py-2 bg-slate-900 rounded-lg">
+          <p className="text-sm text-slate-400">Connect wallet to place a bid</p>
+        </div>
+      )}
 
-  if (!signedTx) {
-    throw new Error('Failed to retrieve cached transaction. The transaction may not have been cached properly.');
-  }
-  console.log('✓ Cached transaction retrieved');
+      {isOwner && phase !== 'ended' && (
+        <div className="text-center py-2 bg-blue-500/10 rounded-lg border border-blue-500/20">
+          <p className="text-sm text-blue-400">Your Auction</p>
+        </div>
+      )}
 
-  // Step 5: Encrypt the transaction
-  console.log('Step 5: Encrypting transaction with TPKE');
-  const signedTxBytes = ethers.getBytes(signedTx);
-  const { encryptedKey, encryptedMsg, roundNumber } = await encryptTransaction(signedTxBytes, NEO_X_AMEV_RPC);
-  console.log('✓ Transaction encrypted');
-
-  // Step 6: Construct the envelope
-  console.log('Step 6: Creating transaction envelope');
-  const innerTxHash = ethers.keccak256(signedTx);
-  const envelopeData = constructEnvelopeData(
-    roundNumber,
-    500000,
-    innerTxHash,
-    encryptedKey,
-    encryptedMsg
+      {phase === 'ended' && (
+        <div className="text-center py-2 bg-slate-900 rounded-lg">
+          <p className="text-sm text-slate-400">{phaseInfo.subtitle}</p>
+        </div>
+      )}
+    </div>
   );
-
-  // Step 7: Send the envelope transaction
-  console.log('Step 7: Switching to Standard RPC for envelope submission');
-  await ensureNetwork('STANDARD');
-
-  // Refresh signer for Standard RPC
-  const stdProvider = new ethers.BrowserProvider(window.ethereum);
-  const stdSigner = await stdProvider.getSigner();
-
-  // Get fee data from Standard RPC
-  const feeData = await stdProvider.getFeeData();
-  const gasPrice = feeData.gasPrice || ethers.parseUnits('40', 'gwei');
-  const gasLimit = 850000n; // Slightly more for Anti-MEV
-  const gasFee = gasPrice * gasLimit;
-  const valueWei = value ? BigInt(value) : 0n;
-  const totalRequired = valueWei + gasFee;
-
-  // Check balance before sending
-  const balance = await stdProvider.getBalance(signerAddress);
-  console.log('Fee Calculation (Standard):', {
-    bidValue: ethers.formatEther(valueWei),
-    estimatedFee: ethers.formatEther(gasFee),
-    totalRequired: ethers.formatEther(totalRequired),
-    currentBalance: ethers.formatEther(balance)
-  });
-
-  if (balance < totalRequired) {
-    const missing = totalRequired - balance;
-    throw new Error(`Insufficient funds on Standard RPC. You need ${ethers.formatUnits(totalRequired, 18)} GAS (Bid + Fees) but only have ${ethers.formatUnits(balance, 18)} GAS.`);
-  }
-
-  const envelopeTx = {
-    to: GOV_REWARD_CONTRACT,
-    data: envelopeData,
-    nonce: nonce,
-    gasLimit: gasLimit,
-    gasPrice: gasPrice,
-    value: valueWei,
-  };
-
-  try {
-    const txResponse = await stdSigner.sendTransaction(envelopeTx);
-    console.log('✓ Envelope submitted to Standard RPC:', txResponse.hash);
-
-    // Step 8: Wait for confirmation
-    console.log('Step 8: Waiting for confirmation');
-    const receipt = await txResponse.wait(1);
-    console.log('✅ Anti-MEV transaction confirmed!', receipt?.hash);
-    return receipt;
-  } catch (error: any) {
-    console.error('Envelope Submission Error:', error);
-    let errorMessage = 'Bidding failed.';
-    if (error.message.includes('Internal JSON-RPC error') || error.message.includes('insufficient funds')) {
-      errorMessage = `Transaction rejected. Balance (${ethers.formatEther(balance)} GAS) may be too low for Bid + Fees, or network switch failed.`;
-    } else if (error.message.includes('user rejected')) {
-      errorMessage = 'Transaction was cancelled.';
-    }
-    throw new Error(errorMessage);
-  }
-}
-
-/**
- * Send a regular (non-MEV-protected) transaction.
- * Simple wrapper that ensures Standard Network connection.
- */
-export async function sendRegularTransaction(
-  contract: ethers.Contract,
-  method: string,
-  params: any[],
-  value?: string
-): Promise<any> {
-  await ensureNetwork('STANDARD');
-
-  // Refresh signer after switch
-  const provider = new ethers.BrowserProvider(window.ethereum);
-  const signer = await provider.getSigner();
-  const contractWithSigner = contract.connect(signer);
-
-  const txOptions: any = {};
-  if (value) txOptions.value = value;
-
-  console.log('Sending regular transaction via wallet...');
-  console.log('Contract address:', contractWithSigner.target);
-  console.log('Params:', params);
-
-  const tx = await contractWithSigner[method](...params, txOptions);
-  console.log('Transaction sent:', tx.hash);
-  const receipt = await tx.wait();
-  return receipt;
-}
-
-export function createBidCommitment(amount: string, secret: string, bidderAddress: string): string {
-  const amountWei = ethers.parseEther(amount);
-  const hash = ethers.solidityPackedKeccak256(
-    ['uint256', 'string', 'address'],
-    [amountWei, secret, bidderAddress]
-  );
-  return hash;
-}
-
-export function generateSecret(): string {
-  return ethers.hexlify(ethers.randomBytes(32));
 }
