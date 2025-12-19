@@ -213,25 +213,40 @@ export async function sendMEVProtectedTransaction(
 
   // Step 7: Send the envelope transaction
   console.log('Step 7: Submitting envelope to GovReward contract');
-  // We send Envelope via Anti-MEV RPC (it propagates)
+
+  // Check balance before sending (common cause of Internal JSON-RPC error)
+  const balance = await freshProvider.getBalance(signerAddress);
+  console.log('Current balance:', ethers.formatEther(balance), 'GAS');
+
+  const valueWei = value ? BigInt(value) : 0n;
+  if (balance < valueWei) {
+    throw new Error(`Insufficient GAS balance. You need at least ${ethers.formatEther(valueWei)} GAS to place this bid, plus extra for transaction fees.`);
+  }
 
   const envelopeTx = {
     to: GOV_REWARD_CONTRACT,
     data: envelopeData,
-    nonce: nonce, // MUST match inner tx nonce
-    gasLimit: 700000n,
-    value: 0n,
+    nonce: nonce,
+    gasLimit: 800000n, // Slightly higher for safety
+    value: valueWei,
   };
 
-  const txResponse = await signer.sendTransaction(envelopeTx);
-  console.log('✓ Envelope submitted:', txResponse.hash);
+  try {
+    const txResponse = await signer.sendTransaction(envelopeTx);
+    console.log('✓ Envelope submitted:', txResponse.hash);
 
-  // Step 8: Wait for confirmation
-  console.log('Step 8: Waiting for confirmation');
-  const receipt = await txResponse.wait(1);
-  console.log('✅ Anti-MEV transaction confirmed!', receipt?.hash);
-
-  return receipt;
+    // Step 8: Wait for confirmation
+    console.log('Step 8: Waiting for confirmation');
+    const receipt = await txResponse.wait(1);
+    console.log('✅ Anti-MEV transaction confirmed!', receipt?.hash);
+    return receipt;
+  } catch (error: any) {
+    console.error('Envelope Submission Error:', error);
+    if (error.message.includes('Internal JSON-RPC error')) {
+      throw new Error('Transaction failed. This usually means you have 0 GAS balance or a nonce mismatch. Please check your wallet funds.');
+    }
+    throw error;
+  }
 }
 
 /**
