@@ -20,6 +20,7 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
   const [committedAmount, setCommittedAmount] = useState<string | null>(null);
   const [phase, setPhase] = useState<AuctionPhase>('active');
   const [revealTime, setRevealTime] = useState<Date | null>(null);
+  const [bidCount, setBidCount] = useState(0);
 
   const endTime = new Date(auction.end_time);
   const now = new Date();
@@ -74,7 +75,25 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
 
     updatePhase();
     const interval = setInterval(updatePhase, 5000);
-    return () => clearInterval(interval);
+
+    const fetchBidCount = async () => {
+      const { count, error } = await supabase
+        .from('bids')
+        .select('*', { count: 'exact', head: true })
+        .eq('blockchain_auction_id', auction.blockchain_auction_id);
+
+      if (!error && count !== null) {
+        setBidCount(count);
+      }
+    };
+
+    fetchBidCount();
+    const bidInterval = setInterval(fetchBidCount, 5000);
+
+    return () => {
+      clearInterval(interval);
+      clearInterval(bidInterval);
+    };
   }, [auction, provider, isExpired]);
 
   const formatTime = (ms: number) => {
@@ -173,31 +192,42 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
 
       console.log('Creating commitment:', { bidAmount, secret, commitment });
 
-      const receipt = await sendMEVProtectedTransaction(
+      const tx = await sendMEVProtectedTransaction(
         contract,
         'commitBid',
         [auction.blockchain_auction_id, commitment],
         bidAmountWei.toString()
       );
 
-      // Record in Supabase as hidden bid
-      await supabase.from('bids').insert({
+      // Record in Supabase as hidden bid IMMEDIATELY after broadcasting
+      const { error: insertError } = await supabase.from('bids').insert({
         auction_id: auction.id,
         blockchain_auction_id: auction.blockchain_auction_id,
         bidder_address: userAddress,
         bid_amount: '0', // Hidden
-        transaction_hash: receipt.hash,
+        transaction_hash: tx.hash,
         mev_protected: true,
       });
+
+      if (insertError) {
+        console.error('❌ Supabase insert error:', insertError);
+      } else {
+        console.log('✅ Bid placeholder recorded in Supabase');
+      }
 
       setCommittedSecret(secret);
       setCommittedAmount(bidAmount);
       localStorage.setItem(`bid_secret_${auction.blockchain_auction_id}_${userAddress}`, secret);
       localStorage.setItem(`bid_amount_${auction.blockchain_auction_id}_${userAddress}`, bidAmount);
 
-      alert('Bid committed successfully! Your bid is hidden until the reveal phase. Keep this window open or save your bid details.');
+      alert('Bid committed successfully! Your bid is now visible as "Hidden".');
       setBidAmount('');
       onBidPlaced();
+
+      // Background wait for confirmation just for logging
+      tx.wait(1).then(() => {
+        console.log('✅ Anti-MEV bid confirmed on-chain:', tx.hash);
+      });
     } catch (error: any) {
       console.error('Error committing bid:', error);
       alert(`Failed to commit bid: ${error.message}`);
@@ -373,13 +403,20 @@ export function AuctionCard({ auction, provider, userAddress, onBidPlaced }: Auc
         </div>
       </div>
 
-      {auction.highest_bidder && phase !== 'commit' && (
+      {(bidCount > 0 || (auction.highest_bidder && phase !== 'commit')) && (
         <div className="flex items-center space-x-2 mb-4 px-3 py-2 bg-slate-900 rounded-lg">
-          <User className="h-4 w-4 text-slate-400" />
-          <span className="text-xs text-slate-400">Leading:</span>
-          <span className="text-xs text-white font-mono">
-            {auction.highest_bidder.slice(0, 6)}...{auction.highest_bidder.slice(-4)}
-          </span>
+          <TrendingUp className="h-4 w-4 text-slate-400" />
+          <span className="text-xs text-slate-400">Total Bids:</span>
+          <span className="text-xs text-white font-medium">{bidCount}</span>
+          {auction.highest_bidder && phase !== 'commit' && (
+            <>
+              <span className="text-slate-700 mx-1">|</span>
+              <User className="h-4 w-4 text-slate-400" />
+              <span className="text-xs text-white font-mono">
+                {auction.highest_bidder.slice(0, 6)}...{auction.highest_bidder.slice(-4)}
+              </span>
+            </>
+          )}
         </div>
       )}
 
