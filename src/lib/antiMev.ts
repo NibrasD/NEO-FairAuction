@@ -62,26 +62,43 @@ export function calculateThreshold(consensusSize: number): number {
  * Encrypts a signed transaction using TPKE with the aggregated commitment.
  */
 export async function encryptTransaction(
-  signedTxBytes: Uint8Array,
+  txBytes: Uint8Array,
   providerRpcUrl: string = NEO_X_AMEV_RPC
 ): Promise<{ encryptedKey: Uint8Array; encryptedMsg: Uint8Array; roundNumber: number }> {
+  console.log('--- Encrypting Transaction ---');
   // Get TPKE parameters from contracts
   const consensusSize = await getConsensusSize(providerRpcUrl);
   const roundNumber = await getRoundNumber(providerRpcUrl);
   const aggregatedCommitment = await getAggregatedCommitment(roundNumber, providerRpcUrl);
 
-  console.log('TPKE params:', { consensusSize, roundNumber, threshold: calculateThreshold(consensusSize) });
+  // Simulate DKG round info structure for logging purposes
+  const roundInfo = {
+    consensus_size: consensusSize,
+    round_number: roundNumber,
+    threshold: calculateThreshold(consensusSize),
+    public_key: aggregatedCommitment, // Using aggregatedCommitment as public_key for TPKE
+  };
+
+  console.log('DKG Round Info:', JSON.stringify(roundInfo));
+
+  if (!roundInfo || !roundInfo.public_key) {
+    throw new Error('Could not retrieve Anti-MEV public key from node');
+  }
+
+  const commitmentHex = roundInfo.public_key.startsWith('0x') ? roundInfo.public_key.slice(2) : roundInfo.public_key;
+  const commitment = ethers.getBytes('0x' + commitmentHex);
+  console.log('Commitment bytes length:', commitment.length);
+  console.log('Commitment hex (first 20 bytes):', commitmentHex.slice(0, 40));
 
   // Create public key from aggregated commitment
-  const threshold = calculateThreshold(consensusSize);
-  const publicKey = TpkePublicKey.fromAggregatedCommitment(
-    ethers.getBytes(aggregatedCommitment),
-    consensusSize,
-    threshold
+  const tpk = TpkePublicKey.fromAggregatedCommitment(
+    commitment,
+    roundInfo.consensus_size,
+    roundInfo.threshold
   );
 
   // Encrypt the transaction
-  const { encryptedKey, encryptedMsg } = publicKey.encrypt(signedTxBytes);
+  const { encryptedKey, encryptedMsg } = tpk.encrypt(txBytes);
 
   return { encryptedKey, encryptedMsg, roundNumber };
 }

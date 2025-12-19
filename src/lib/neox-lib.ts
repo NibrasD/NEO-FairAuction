@@ -58,37 +58,46 @@ export class TpkePublicKey {
         _consensusSize: number,
         _threshold: number
     ): TpkePublicKey {
-        console.log('Aggregated commitment length:', commitment.length);
+        console.log('--- fromAggregatedCommitment ---');
+        console.log('Commitment length:', commitment.length);
+        console.log('Commitment hex:', bytesToHex(commitment).slice(0, 80));
 
         // Try extracting as compressed G1 (48 bytes)
         if (commitment.length >= 48) {
             try {
                 const g1Bytes = commitment.slice(0, 48);
                 const hexString = bytesToHex(g1Bytes);
+                console.log('Attempting G1.fromHex with 48 bytes...');
                 const point = G1.fromHex(hexString);
-                console.log('Created TPKE public key from first 48 bytes');
+                console.log('✓ Success: G1.fromHex');
                 return new TpkePublicKey(point);
-            } catch (e) {
-                console.log('Failed to parse first 48 bytes as G1, trying alternate format');
+            } catch (e: any) {
+                console.log('Failed G1 parsing (0-48):', e.message);
             }
         }
 
         // Alternative: Skip first 32 bytes (padding), take next 48
-        if (commitment.length >= 96) {
+        if (commitment.length >= 80) {
             try {
                 const g1Bytes = commitment.slice(32, 80);
                 const hexString = bytesToHex(g1Bytes);
+                console.log('Attempting G1.fromHex with bytes 32-80...');
                 const point = G1.fromHex(hexString);
-                console.log('Created TPKE public key from bytes 32-80');
+                console.log('✓ Success: G1.fromHex (32-80)');
                 return new TpkePublicKey(point);
-            } catch (e) {
-                console.log('Failed alternate G1 parsing');
+            } catch (e: any) {
+                console.log('Failed alternate G1 parsing (32-80):', e.message);
             }
         }
 
-        // If all else fails, try the full commitment
-        const point = G1.fromHex(bytesToHex(commitment));
-        return new TpkePublicKey(point);
+        console.warn('Final fallback: trying full commitment parsing...');
+        try {
+            const point = G1.fromHex(bytesToHex(commitment));
+            return new TpkePublicKey(point);
+        } catch (e: any) {
+            console.error('Final fallback failed:', e.message);
+            throw new Error(`Invalid TPKE public key format. Expected 48 or 96 bytes, got ${commitment.length}. Error: ${e.message}`);
+        }
     }
 
     encrypt(msg: Uint8Array): { encryptedKey: Uint8Array; encryptedMsg: Uint8Array } {
