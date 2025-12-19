@@ -158,22 +158,21 @@ export async function sendMEVProtectedTransaction(
   const signerAddress = await signer.getAddress();
   console.log('✓ Account:', signerAddress);
 
-  // Step 1: Get single source-of-truth nonce from RPC 1
+  // Step 1: Get source-of-truth nonce from Standard RPC (RPC 1) ALWAYS
   console.log('Step 1: Getting transaction nonce from Standard RPC (RPC 1)');
   const stdRpcProvider = new ethers.JsonRpcProvider(NEO_X_STANDARD_RPC);
   const nonce = await stdRpcProvider.getTransactionCount(signerAddress, 'latest');
-  console.log('✓ Nonce (latest):', nonce);
+  console.log('✓ Nonce (source-of-truth from RPC 1):', nonce);
 
   // Balance Check (using RPC 1)
   const balance = await stdRpcProvider.getBalance(signerAddress);
   console.log('✓ Current Balance:', ethers.formatEther(balance), 'GAS');
 
   const bidValue = value ? BigInt(value) : 0n;
-  const estimatedFee = ethers.parseUnits('40', 'gwei') * 2000000n; // 0.08 GAS
-  const totalRequired = bidValue + estimatedFee;
+  const totalRequired = bidValue + ethers.parseUnits('0.1', 'ether'); // Conservatively 0.1 GAS for everything
 
   if (balance < totalRequired) {
-    throw new Error(`Insufficient GAS balance. Required for bid + envelope: ~${ethers.formatEther(totalRequired)} GAS, Available: ${ethers.formatEther(balance)} GAS`);
+    throw new Error(`Current balance on RPC 1 (${ethers.formatEther(balance)} GAS) is too low for bid (${ethers.formatEther(bidValue)}) + fees.`);
   }
 
   // Step 2: Build, Sign, and send transaction to Anti-MEV RPC (will be cached)
@@ -250,15 +249,18 @@ export async function sendMEVProtectedTransaction(
   await ensureNetwork('STANDARD');
 
   // Re-initialize for Standard RPC
+  await ensureNetwork('STANDARD');
+  await new Promise(r => setTimeout(r, 1000)); // Crucial: wait for wallet to switch
+
   const stdProvider = new ethers.BrowserProvider(window.ethereum);
   const stdSigner = await stdProvider.getSigner();
 
-  // Final verification check on RPC 1
-  const checkNonce = await stdProvider.getTransactionCount(signerAddress, 'latest');
-  console.log('Step 7.1: Verifying active nonce on RPC 1:', checkNonce);
+  // Nonce re-verification (should match the starting nonce)
+  const finalCheckNonce = await stdProvider.getTransactionCount(signerAddress, 'latest');
+  console.log('Step 7.1: Final Nonce check on RPC 1:', finalCheckNonce);
 
-  if (checkNonce !== nonce) {
-    console.warn(`⚠️ Nonce discrepancy! RPC 1 says ${checkNonce}, but we started with ${nonce}. Proceeding with ${nonce} to match cached tx.`);
+  if (finalCheckNonce !== nonce) {
+    console.warn(`⚠️ Nonce discrepancy detected! State says ${finalCheckNonce}, but we cached with ${nonce}. Attempting alignment with ${nonce}.`);
   }
 
   // Use legacy gas price to avoid EIP-1559 issues
@@ -270,17 +272,11 @@ export async function sendMEVProtectedTransaction(
     finalGasPrice = ethers.parseUnits('40', 'gwei');
   }
 
-  const gasLimit = 2000000n; // Keep at 2M for GovReward
+  const gasLimit = 2000000n;
   const valueWei = value ? BigInt(value) : 0n;
 
   console.log('Submitting envelope to GovReward contract on Standard RPC...');
-  console.log('Envelope Params:', {
-    to: GOV_REWARD_CONTRACT,
-    nonce: nonce,
-    gasLimit: gasLimit.toString(),
-    gasPrice: ethers.formatUnits(finalGasPrice, 'gwei') + ' gwei',
-    value: ethers.formatEther(valueWei) + ' GAS'
-  });
+  console.log('Envelope Data Sample:', envelopeData.slice(0, 42) + '...');
 
   const envelopeTx = {
     to: GOV_REWARD_CONTRACT,
@@ -294,13 +290,13 @@ export async function sendMEVProtectedTransaction(
 
   try {
     const txResponse = await stdSigner.sendTransaction(envelopeTx);
-    console.log('✓ Envelope broadcasted:', txResponse.hash);
+    console.log('✓ Envelope submitted successfully:', txResponse.hash);
     return txResponse;
   } catch (error: any) {
     console.error('Submission Error:', error);
-    let errorMsg = error.message;
-    if (error.data) errorMsg += ` (Data: ${JSON.stringify(error.data)})`;
-    throw new Error(`Envelop submission failed: ${errorMsg}`);
+    // Be very verbose about the internal error details
+    const detail = error.data?.message || error.error?.message || error.message;
+    throw new Error(`Final submission failed: ${detail}`);
   }
 }
 
